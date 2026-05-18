@@ -15,47 +15,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 logger = logging.getLogger(__name__)
 
 
-class TaskStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCESS = "success"
-    FAILED = "failed"
-    TIMEOUT = "timeout"
-    CANCELLED = "cancelled"
-    RETRY = "retry"
+from ..core.interfaces import ITaskEngine, Task, TaskStatus
 
 
-@dataclass
-class Task:
-    """任务定义"""
-    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    name: str = ""
-    task_type: str = "general"        # general / research / process / custom
-    handler: Optional[Callable] = None
-    args: tuple = ()
-    kwargs: Dict[str, Any] = field(default_factory=dict)
-    priority: int = 5                 # 1(最高) - 10(最低)
-    status: TaskStatus = TaskStatus.PENDING
-    result: Any = None
-    error: str = ""
-    retries: int = 0
-    max_retries: int = 3
-    timeout: int = 300
-    created_at: float = field(default_factory=time.time)
-    started_at: float = 0.0
-    finished_at: float = 0.0
-    duration: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
-
-    def is_cancelled(self) -> bool:
-        return self._cancel_event.is_set()
-
-    def cancel(self):
-        self._cancel_event.set()
-
-
-class TaskEngine:
+class TaskEngine(ITaskEngine):
     """任务执行引擎（增强版）"""
 
     def __init__(self, max_workers: int = 3, retry_limit: int = 3, timeout: int = 300):
@@ -72,6 +35,7 @@ class TaskEngine:
         self._on_task_complete: Optional[Callable] = None
         self._lock = threading.RLock()
         self._shutdown = False
+        self._cancel_events: Dict[str, threading.Event] = {}
 
     def submit(self, name: str, handler: Callable, args: tuple = (), kwargs: Dict = None,
                task_type: str = "general", priority: int = 5, timeout: int = 0,
@@ -82,16 +46,21 @@ class TaskEngine:
                 raise RuntimeError("执行引擎已关闭，无法提交新任务")
 
             task = Task(
+                id=str(uuid.uuid4())[:8],
                 name=name,
-                handler=handler,
-                args=args,
-                kwargs=kwargs or {},
                 task_type=task_type,
                 priority=priority,
-                timeout=timeout or self.default_timeout,
+                status=TaskStatus.PENDING,
+                created_at=time.time(),
                 max_retries=max_retries or self.retry_limit,
+                timeout=timeout or self.default_timeout,
                 metadata=metadata or {},
             )
+            # 存储handler和args/kwargs在内部字典中
+            if not hasattr(self, '_task_handlers'):
+                self._task_handlers: Dict[str, tuple] = {}
+            self._task_handlers[task.id] = (handler, args, kwargs or {})
+            self._cancel_events[task.id] = threading.Event()
             self._queue.append(task)
             logger.info(f"任务已提交: [{task.task_type}] {task.name} (id={task.id}, 优先级={task.priority}, 超时={task.timeout}s)")
             return task
@@ -199,6 +168,9 @@ class TaskEngine:
         task.started_at = time.time()
         with self._lock:
             self._running[task.id] = task
+            # 获取handler信息
+            handler_info = self._task_handlers.get(task.id, (None, (), {}))
+            handler, args, kwargs = handler_info
 
         logger.info(f"开始执行任务: [{task.task_type}] {task.name} (id={task.id}, 超时={task.timeout}s)")
 
@@ -206,18 +178,18 @@ class TaskEngine:
 
         try:
             # 检查是否已取消
-            if task.is_cancelled():
+            if self._cancel_events.get(task.id, threading.Event()).is_set():
                 raise RuntimeError("任务已被取消")
 
             # 防御：handler为None或不可调用
-            if task.handler is None or not callable(task.handler):
-                raise TypeError(f"任务handler不可调用: {type(task.handler)}")
+            if handler is None or not callable(handler):
+                raise TypeError(f"任务handler不可调用: {type(handler)}")
 
             # 执行任务
-            result = task.handler(*task.args, **task.kwargs)
+            result = handler(*args, **kwargs)
 
             # 再次检查取消状态
-            if task.is_cancelled():
+            if self._cancel_events.get(task.id, threading.Event()).is_set():
                 raise RuntimeError("任务执行期间被取消")
 
             task.result = result
@@ -271,7 +243,8 @@ class TaskEngine:
             # 检查是否在队列中
             for task in self._queue:
                 if task.id == task_id:
-                    task.cancel()
+                    if task_id in self._cancel_events:
+                        self._cancel_events[task_id].set()
                     task.status = TaskStatus.CANCELLED
                     self._queue.remove(task)
                     logger.info(f"任务已取消: {task.name}")
@@ -279,7 +252,8 @@ class TaskEngine:
 
             # 检查是否正在运行
             if task_id in self._running:
-                self._running[task_id].cancel()
+                if task_id in self._cancel_events:
+                    self._cancel_events[task_id].set()
                 return True
 
         return False
@@ -329,7 +303,8 @@ class TaskEngine:
 
             if cancel_pending:
                 for task in self._queue:
-                    task.cancel()
+                    if task.id in self._cancel_events:
+                        self._cancel_events[task.id].set()
                     task.status = TaskStatus.CANCELLED
                 logger.info(f"已取消 {len(self._queue)} 个待处理任务")
                 self._queue.clear()
