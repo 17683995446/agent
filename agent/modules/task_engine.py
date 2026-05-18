@@ -116,13 +116,16 @@ class TaskEngine(ITaskEngine):
                 task.status = TaskStatus.TIMEOUT
                 task.error = f"任务执行超时 ({task.timeout}s)"
                 task.finished_at = time.time()
-                task.duration = task.finished_at - task.started_at
-                self._total_failed += 1
-                self._total_executed += 1
+                task.duration = max(0, task.finished_at - task.started_at)
                 with self._lock:
+                    self._total_failed += 1
+                    self._total_executed += 1
                     if task.id in self._running:
                         del self._running[task.id]
                     self._completed.append(task)
+                    # F1修复：清理
+                    self._task_handlers.pop(task.id, None)
+                    self._cancel_events.pop(task.id, None)
                 self._trigger_callback(task)
                 results.append(task)
                 logger.warning(f"任务超时: {task.name}")
@@ -130,13 +133,16 @@ class TaskEngine(ITaskEngine):
                 task.status = TaskStatus.FAILED
                 task.error = str(e)
                 task.finished_at = time.time()
-                task.duration = task.finished_at - task.started_at
-                self._total_failed += 1
-                self._total_executed += 1
+                task.duration = max(0, task.finished_at - task.started_at)
                 with self._lock:
+                    self._total_failed += 1
+                    self._total_executed += 1
                     if task.id in self._running:
                         del self._running[task.id]
                     self._completed.append(task)
+                    # F1修复：清理
+                    self._task_handlers.pop(task.id, None)
+                    self._cancel_events.pop(task.id, None)
                 self._trigger_callback(task)
                 results.append(task)
 
@@ -144,6 +150,9 @@ class TaskEngine(ITaskEngine):
 
     def _execute_wrapper(self, task: Task) -> Task:
         """执行包装器（用于线程池）- 捕获所有异常包括BaseException"""
+        # F4修复：确保started_at已设置
+        if not task.started_at:
+            task.started_at = time.time()
         try:
             return self._execute(task)
         except BaseException as e:
@@ -151,13 +160,16 @@ class TaskEngine(ITaskEngine):
             task.status = TaskStatus.FAILED
             task.error = f"[{type(e).__name__}] {str(e)}"
             task.finished_at = time.time()
-            task.duration = task.finished_at - task.started_at
+            task.duration = max(0, task.finished_at - task.started_at)
             with self._lock:
                 self._total_failed += 1
                 self._total_executed += 1
                 if task.id in self._running:
                     del self._running[task.id]
                 self._completed.append(task)
+                # F1修复：清理
+                self._task_handlers.pop(task.id, None)
+                self._cancel_events.pop(task.id, None)
             self._trigger_callback(task)
             logger.error(f"任务捕获极端异常: {task.name} - {type(e).__name__}: {e}")
             return task
@@ -220,11 +232,15 @@ class TaskEngine(ITaskEngine):
                 if task.id in self._running:
                     del self._running[task.id]
 
-            # 只有非RETRY状态才计入统计和触发回调
-            if should_count:
-                self._total_executed += 1
-                with self._lock:
+                # 只有非RETRY状态才计入统计和触发回调
+                if should_count:
+                    self._total_executed += 1
                     self._completed.append(task)
+                    # F1修复：清理已完成任务handler和cancel_event
+                    self._task_handlers.pop(task.id, None)
+                    self._cancel_events.pop(task.id, None)
+
+            if should_count:
                 self._trigger_callback(task)
 
         return task

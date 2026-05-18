@@ -149,33 +149,16 @@ class Agent:
 
             if isinstance(result, list):
                 for item in result:
-                    if isinstance(item, Task):
-                        # 通过submit添加以确保正确初始化
-                        self.engine.submit(
-                            name=item.name,
-                            handler=item.handler,
-                            args=item.args,
-                            kwargs=item.kwargs,
-                            task_type=item.task_type,
-                            priority=item.priority,
-                            timeout=item.timeout,
-                            max_retries=item.max_retries,
-                            metadata=item.metadata,
-                        )
-                    elif isinstance(item, dict):
+                    if isinstance(item, dict):
                         self.engine.submit(**item)
+                    elif isinstance(item, Task):
+                        # F2修复：新Task是纯数据对象，无handler属性
+                        # 需要通过metadata或外部注册handler，否则跳过并警告
+                        logger.warning(f"任务生成器返回了Task数据对象但无handler，已跳过: {getattr(item, 'name', 'unknown')}")
+                    else:
+                        logger.warning(f"任务生成器返回了不支持的类型: {type(item)}")
             elif isinstance(result, Task):
-                self.engine.submit(
-                    name=result.name,
-                    handler=result.handler,
-                    args=result.args,
-                    kwargs=result.kwargs,
-                    task_type=result.task_type,
-                    priority=result.priority,
-                    timeout=result.timeout,
-                    max_retries=result.max_retries,
-                    metadata=result.metadata,
-                )
+                logger.warning(f"任务生成器返回了Task数据对象但无handler，已跳过: {getattr(result, 'name', 'unknown')}")
             elif isinstance(result, dict):
                 self.engine.submit(**result)
 

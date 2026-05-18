@@ -205,7 +205,8 @@ def test_optimizer_unexpected_json():
     # 测试reflect_on_tasks不崩溃
     try:
         from agent.modules.task_engine import Task
-        task = Task(name="测试任务", task_type="test")
+        task = Task(id="test1", name="测试任务", task_type="test", priority=5,
+                     status=TaskStatus.SUCCESS, created_at=time.time(), max_retries=0, timeout=5)
         task.status = TaskStatus.SUCCESS
         task.duration = 1.0
         task.result = "ok"
@@ -217,7 +218,8 @@ def test_optimizer_unexpected_json():
 
     # 测试analyze_failure不崩溃
     try:
-        task2 = Task(name="失败任务", task_type="test")
+        task2 = Task(id="test2", name="失败任务", task_type="test", priority=5,
+                      status=TaskStatus.FAILED, created_at=time.time(), max_retries=1, timeout=5)
         task2.status = TaskStatus.FAILED
         task2.error = "测试错误"
         task2.retries = 1
@@ -259,9 +261,11 @@ def test_result_serialization():
         ("大字典", {f"key_{i}": f"value_{i}" * 100 for i in range(100)}),
     ]
 
-    for name, result_value in test_results:
+    for idx, (name, result_value) in enumerate(test_results):
         try:
-            task = Task(name=f"序列化测试-{name}", task_type="test")
+            task = Task(id=f"ser_{idx}", name=f"序列化测试-{name}", task_type="test",
+                        priority=5, status=TaskStatus.SUCCESS, created_at=time.time(),
+                        max_retries=0, timeout=5)
             task.status = TaskStatus.SUCCESS
             task.duration = 1.0
             task.result = result_value
