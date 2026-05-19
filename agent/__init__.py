@@ -54,10 +54,43 @@ class Agent:
         # 自定义任务生成器
         self._task_generator: Optional[Callable] = None
 
+        # P2修复：优化专用后台线程
+        self._optimize_thread: Optional[threading.Thread] = None
+        self._optimize_queue: List = []
+        self._optimize_queue_lock = threading.Lock()
+        self._optimize_stop_event = threading.Event()
+
         # 初始经验
         self._seed_initial_knowledge()
 
         logger.info("Agent初始化完成 ✓")
+
+    def _start_optimize_thread(self):
+        """P2修复：启动后台优化线程"""
+        self._optimize_stop_event.clear()
+
+        def _optimize_worker():
+            while not self._optimize_stop_event.is_set():
+                tasks_to_optimize = []
+                with self._optimize_queue_lock:
+                    if self._optimize_queue:
+                        tasks_to_optimize = self._optimize_queue[:]
+                        self._optimize_queue.clear()
+
+                if tasks_to_optimize:
+                    try:
+                        self.optimizer.reflect_on_tasks(tasks_to_optimize)
+                    except Exception as e:
+                        logger.error(f"后台优化异常: {e}")
+
+                # 短暂休眠避免空转
+                self._optimize_stop_event.wait(timeout=0.5)
+
+        self._optimize_thread = threading.Thread(
+            target=_optimize_worker, name="OptimizeWorker", daemon=True
+        )
+        self._optimize_thread.start()
+        logger.info("后台优化线程已启动")
 
     def _seed_initial_knowledge(self):
         """注入初始知识"""
@@ -106,28 +139,29 @@ class Agent:
         return self.engine.submit(name=name, handler=handler, **kwargs)
 
     def _on_task_done(self, task: Task):
-        """任务完成回调 - 触发优化和知识存储（线程安全）"""
+        """任务完成回调 - 触发优化和知识存储（P2修复：异步优化）"""
         with self._lock:
             self._tasks_since_last_optimize += 1
             should_optimize = self._tasks_since_last_optimize >= self.config.optimize_interval
 
-        # 失败任务立即分析
+        # 失败任务立即分析（轻量操作，保持同步）
         if task.status in (TaskStatus.FAILED, TaskStatus.TIMEOUT):
             try:
                 self.optimizer.analyze_failure(task)
             except Exception as e:
                 logger.error(f"失败分析异常: {e}")
 
-        # 达到优化间隔，触发反思
+        # 达到优化间隔，将任务放入后台优化队列（P2修复：不再阻塞执行线程）
         if should_optimize:
             with self._lock:
                 self._tasks_since_last_optimize = 0
             try:
                 recent = self.engine.get_recent_completed(limit=self.config.optimize_interval)
                 if recent:
-                    self.optimizer.reflect_on_tasks(recent)
+                    with self._optimize_queue_lock:
+                        self._optimize_queue.append(recent)
             except Exception as e:
-                logger.error(f"优化反思异常: {e}")
+                logger.error(f"优化入队异常: {e}")
 
         # 定期清理完成任务记录（防止内存泄漏）
         if self.engine.stats['total_executed'] % 50 == 0:
@@ -172,7 +206,7 @@ class Agent:
             self._cycle_count += 1
             current_cycle = self._cycle_count
 
-        # 1. 从知识图谱调取经验
+        # 1. 从知识图谱调取经验（P1修复：主动查询并利用经验）
         if current_cycle == 1 or current_cycle % 10 == 0:
             try:
                 advice = self.optimizer.get_optimization_advice()
@@ -187,6 +221,17 @@ class Agent:
         # 3. 执行任务
         pending = self.engine.pending_count
         if pending > 0:
+            # P1修复：执行前查询相关经验，形成知识→执行闭环
+            try:
+                pending_types = set()
+                with self._lock:
+                    for task in self.engine._queue[:5]:
+                        pending_types.add(getattr(task, 'task_type', 'general'))
+                for tt in list(pending_types)[:3]:
+                    self.knowledge.query_experience(tt, limit=2)
+            except Exception:
+                pass
+
             batch_size = min(self.config.max_concurrent_tasks, pending)
             self.engine.run_batch(batch_size)
         else:
@@ -254,6 +299,9 @@ class Agent:
         logger.info(f"   模式: {'无限运行' if max_cycles == 0 else f'最多{max_cycles}轮'}")
         logger.info("=" * 60)
 
+        # P2修复：启动后台优化线程
+        self._start_optimize_thread()
+
         try:
             while True:
                 with self._lock:
@@ -301,6 +349,18 @@ class Agent:
             self._shutdown_event.set()
 
         logger.info("正在停止Agent...")
+
+        # P2修复：停止后台优化线程
+        self._optimize_stop_event.set()
+        if self._optimize_thread and self._optimize_thread.is_alive():
+            self._optimize_thread.join(timeout=5)
+
+        # 等待优化队列清空
+        for _ in range(10):
+            with self._optimize_queue_lock:
+                if not self._optimize_queue:
+                    break
+            time.sleep(0.2)
 
         # 关闭执行引擎
         try:

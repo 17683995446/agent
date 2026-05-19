@@ -362,8 +362,15 @@ class KnowledgeGraph:
         return node_id
 
     def query_experience(self, query: str, limit: int = 5) -> List[KnowledgeNode]:
-        """查询相关经验"""
-        return self.search_nodes(query, category="experience", limit=limit)
+        """查询相关经验（P4修复：查询后自动更新usage_count）"""
+        results = self.search_nodes(query, category="experience", limit=limit)
+        # P4修复：每次查询经验时更新usage_count，形成学习反馈闭环
+        for node in results:
+            try:
+                self.update_node_usage(node.id, success=True)
+            except Exception:
+                pass
+        return results
 
     def get_all_knowledge_summary(self) -> Dict[str, Any]:
         """获取知识库全局摘要"""
