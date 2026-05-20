@@ -3,9 +3,12 @@
 定义所有模块的抽象接口，实现依赖倒置
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
+
+if TYPE_CHECKING:
+    from agent.modules.knowledge_graph import KnowledgeNode
 
 
 class TaskStatus(Enum):
@@ -103,8 +106,7 @@ class IKnowledgeGraph(ABC):
     """知识图谱抽象接口"""
 
     @abstractmethod
-    def add_node(self, category: str, title: str, content: str = "",
-                 tags: str = "", importance: float = 0.5) -> int:
+    def add_node(self, node: 'KnowledgeNode') -> int:
         """添加知识节点"""
         pass
 

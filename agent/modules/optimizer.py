@@ -274,45 +274,11 @@ class Optimizer:
 
     def _cleanup_knowledge(self) -> int:
         """执行实际的知识清理"""
-        cleaned = 0
         try:
-            conn = self.kg._get_connection()
-            with self.kg._lock:
-                c = conn.cursor()
-
-                # 1. 清理重要性极低且长期未使用的经验
-                c.execute("""
-                    DELETE FROM nodes WHERE
-                        category = 'experience'
-                        AND importance < 0.2
-                        AND usage_count = 0
-                        AND updated_at < ?
-                """, (time.time() - 3600,))  # 1小时前的低价值经验
-                cleaned += c.rowcount
-
-                # 2. 清理过多的错误记录（保留最近100条）
-                c.execute("""
-                    DELETE FROM task_logs WHERE id NOT IN (
-                        SELECT id FROM task_logs ORDER BY created_at DESC LIMIT 100
-                    )
-                """)
-                cleaned += c.rowcount
-
-                # 3. 失效率过高的策略自动停用
-                c.execute("""
-                    UPDATE strategies SET is_active = 0
-                    WHERE success_count + fail_count > 5
-                    AND CAST(fail_count AS REAL) / (success_count + fail_count) > 0.8
-                """)
-                deactivated = c.rowcount
-                if deactivated > 0:
-                    logger.info(f"停用了{deactivated}个低效策略")
-
-                conn.commit()
+            return self.kg.cleanup_old_knowledge()
         except Exception as e:
             logger.error(f"知识清理执行失败: {e}")
-
-        return cleaned
+            return 0
 
     @property
     def stats(self) -> Dict[str, Any]:

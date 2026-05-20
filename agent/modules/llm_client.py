@@ -5,6 +5,7 @@ LLM客户端模块 - 统一大模型接口（增强版：重试/熔断/容错）
 import json
 import logging
 import time
+import threading
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ class LLMClient:
         self._max_consecutive_failures = 5  # 熔断阈值
         self._circuit_open = False
         self._circuit_open_until = 0
+        self._lock = threading.Lock()
         self._init_client()
 
     def _init_client(self):
@@ -52,32 +54,35 @@ class LLMClient:
 
     def _is_circuit_open(self) -> bool:
         """检查熔断器是否打开"""
-        if not self._circuit_open:
-            return False
-        if time.time() > self._circuit_open_until:
-            # 熔断恢复期，尝试半开
-            self._circuit_open = False
-            self._consecutive_failures = 0
-            logger.info("熔断器半开，尝试恢复LLM调用")
-            return False
-        return True
+        with self._lock:
+            if not self._circuit_open:
+                return False
+            if time.time() > self._circuit_open_until:
+                # 熔断恢复期，尝试半开
+                self._circuit_open = False
+                self._consecutive_failures = 0
+                logger.info("熔断器半开，尝试恢复LLM调用")
+                return False
+            return True
 
     def _record_success(self):
         """记录成功，重置熔断"""
-        self._consecutive_failures = 0
-        self._circuit_open = False
+        with self._lock:
+            self._consecutive_failures = 0
+            self._circuit_open = False
 
     def _record_failure(self):
         """记录失败，检查是否需要熔断"""
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self._max_consecutive_failures:
-            self._circuit_open = True
-            # M5修复：熔断5秒（测试用），生产环境可配置
-            self._circuit_open_until = time.time() + 5
-            logger.warning(
-                f"LLM熔断器打开! 连续失败{self._consecutive_failures}次，"
-                f"将在5秒后尝试恢复"
-            )
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                self._circuit_open = True
+                # M5修复：熔断5秒（测试用），生产环境可配置
+                self._circuit_open_until = time.time() + 5
+                logger.warning(
+                    f"LLM熔断器打开! 连续失败{self._consecutive_failures}次，"
+                    f"将在5秒后尝试恢复"
+                )
 
     def chat(self, messages: List[Dict[str, str]],
              system_prompt: str = "", temperature: float = None,

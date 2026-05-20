@@ -143,6 +143,8 @@ class Agent:
         with self._lock:
             self._tasks_since_last_optimize += 1
             should_optimize = self._tasks_since_last_optimize >= self.config.optimize_interval
+            if should_optimize:
+                self._tasks_since_last_optimize = 0
 
         # 失败任务立即分析（轻量操作，保持同步）
         if task.status in (TaskStatus.FAILED, TaskStatus.TIMEOUT):
@@ -153,8 +155,6 @@ class Agent:
 
         # 达到优化间隔，将任务放入后台优化队列（P2修复：不再阻塞执行线程）
         if should_optimize:
-            with self._lock:
-                self._tasks_since_last_optimize = 0
             try:
                 recent = self.engine.get_recent_completed(limit=self.config.optimize_interval)
                 if recent:
@@ -221,17 +221,6 @@ class Agent:
         # 3. 执行任务
         pending = self.engine.pending_count
         if pending > 0:
-            # P1修复：执行前查询相关经验，形成知识→执行闭环
-            try:
-                pending_types = set()
-                with self._lock:
-                    for task in self.engine._queue[:5]:
-                        pending_types.add(getattr(task, 'task_type', 'general'))
-                for tt in list(pending_types)[:3]:
-                    self.knowledge.query_experience(tt, limit=2)
-            except Exception:
-                pass
-
             batch_size = min(self.config.max_concurrent_tasks, pending)
             self.engine.run_batch(batch_size)
         else:
@@ -408,6 +397,15 @@ class Agent:
         except Exception as e:
             logger.error(f"数据库优化失败: {e}")
 
+        # 关闭LLM客户端
+        try:
+            if hasattr(self.llm, '_http_client') and self.llm._http_client:
+                self.llm._http_client.close()
+                self.llm._http_client = None
+                logger.info("LLM客户端已关闭")
+        except Exception as e:
+            logger.error(f"LLM客户端关闭失败: {e}")
+
         # 关闭知识图谱
         try:
             self.knowledge.close()
@@ -478,12 +476,12 @@ def run_with_watchdog(agent: Agent, max_cycles: int = 0, cycle_interval: float =
             logger.info(f"等待 {restart_cooldown} 秒后重启...")
             time.sleep(restart_cooldown)
 
-            # 重建Agent（先释放旧资源）
+            # 重建Agent（先完整释放旧资源）
             try:
                 old_agent = agent
                 old_config = old_agent.config
                 try:
-                    old_agent.knowledge.close()
+                    old_agent.stop()  # 完整关闭旧Agent（包括engine和llm）
                 except Exception:
                     pass
                 agent = Agent(old_config)

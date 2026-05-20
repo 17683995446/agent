@@ -48,23 +48,28 @@ class KnowledgeGraph:
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self._lock = threading.RLock()  # 可重入锁
         self._local = threading.local()  # 线程本地存储
+        self._all_connections = []  # 跟踪所有连接
+        self._connections_lock = threading.Lock()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
         """获取线程专属连接"""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(
+            conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
                 timeout=30.0,  # 等待锁超时
                 isolation_level=None,  # 自动提交模式，避免长期持有锁
             )
-            self._local.conn.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row
             # 启用WAL模式提高并发性能
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             # C1修复：增加busy_timeout，多Agent共享时等待锁释放
-            self._local.conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+            with self._connections_lock:
+                self._all_connections.append(conn)
         return self._local.conn
 
     @contextmanager
@@ -215,6 +220,8 @@ class KnowledgeGraph:
 
     def get_related_nodes(self, node_id: int, relation: str = "", depth: int = 1) -> List[KnowledgeNode]:
         """获取关联节点"""
+        if depth != 1:
+            logger.warning(f"get_related_nodes: depth={depth}未实现，仅支持depth=1")
         conn = self._get_connection()
         with self._lock:
             c = conn.cursor()
@@ -417,7 +424,29 @@ class KnowledgeGraph:
 
     def close(self):
         """关闭数据库连接"""
-        if hasattr(self._local, 'conn') and self._local.conn:
-            self._local.conn.close()
-            self._local.conn = None
-            logger.debug("知识图谱连接已关闭")
+        # 关闭所有线程的连接
+        with self._connections_lock:
+            for conn in self._all_connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._all_connections.clear()
+        self._local.conn = None
+        logger.debug("知识图谱连接已关闭")
+
+    def cleanup_old_knowledge(self, max_age_seconds: float = 3600, min_importance: float = 0.2, keep_recent_logs: int = 100) -> int:
+        """清理过时知识（公共接口）"""
+        cleaned = 0
+        with self._transaction() as conn:
+            c = conn.cursor()
+            c.execute("""DELETE FROM nodes WHERE category='experience' AND importance < ? AND usage_count = 0 AND updated_at < ?""",
+                      (min_importance, time.time() - max_age_seconds))
+            cleaned += c.rowcount
+            c.execute(f"DELETE FROM task_logs WHERE id NOT IN (SELECT id FROM task_logs ORDER BY created_at DESC LIMIT {keep_recent_logs})")
+            cleaned += c.rowcount
+            c.execute("""UPDATE strategies SET is_active=0 WHERE success_count+fail_count > 5 AND CAST(fail_count AS REAL)/(success_count+fail_count) > 0.8""")
+            deactivated = c.rowcount
+            if deactivated > 0:
+                logger.info(f"停用了{deactivated}个低效策略")
+        return cleaned

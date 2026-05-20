@@ -10,7 +10,7 @@ import threading
 from typing import Optional, Callable, Dict, Any, List
 from dataclasses import dataclass, field
 from enum import Enum
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError, wait, FIRST_COMPLETED, ALL_COMPLETED
 
 logger = logging.getLogger(__name__)
 
@@ -33,32 +33,31 @@ class TaskEngine(ITaskEngine):
         self._total_success = 0
         self._total_failed = 0
         self._on_task_complete: Optional[Callable] = None
+        self._task_handlers: Dict[str, tuple] = {}
         self._lock = threading.RLock()
         self._shutdown = False
         self._cancel_events: Dict[str, threading.Event] = {}
 
     def submit(self, name: str, handler: Callable, args: tuple = (), kwargs: Dict = None,
-               task_type: str = "general", priority: int = 5, timeout: int = 0,
-               max_retries: int = 0, metadata: Dict = None) -> Task:
+               task_type: str = "general", priority: int = 5, timeout: int = None,
+               max_retries: int = None, metadata: Dict = None) -> Task:
         """提交新任务"""
         with self._lock:
             if self._shutdown:
                 raise RuntimeError("执行引擎已关闭，无法提交新任务")
 
             task = Task(
-                id=str(uuid.uuid4())[:8],
+                id=str(uuid.uuid4().hex[:12]),
                 name=name,
                 task_type=task_type,
                 priority=priority,
                 status=TaskStatus.PENDING,
                 created_at=time.time(),
-                max_retries=max_retries or self.retry_limit,
-                timeout=timeout or self.default_timeout,
+                max_retries=max_retries if max_retries is not None else self.retry_limit,
+                timeout=timeout if timeout is not None and timeout > 0 else self.default_timeout,
                 metadata=metadata or {},
             )
             # 存储handler和args/kwargs在内部字典中
-            if not hasattr(self, '_task_handlers'):
-                self._task_handlers: Dict[str, tuple] = {}
             self._task_handlers[task.id] = (handler, args, kwargs or {})
             self._cancel_events[task.id] = threading.Event()
             self._queue.append(task)
@@ -106,8 +105,6 @@ class TaskEngine(ITaskEngine):
 
         results = []
         # D6修复：使用wait代替as_completed，实现真正的超时控制
-        from concurrent.futures import wait, FIRST_COMPLETED, ALL_COMPLETED
-        
         start_time = time.time()
         pending = set(futures.keys())
         
@@ -263,7 +260,9 @@ class TaskEngine(ITaskEngine):
                 task.status = TaskStatus.SUCCESS
                 task.error = ""
                 self._total_success += 1
-            logger.info(f"任务成功: {task.name} (耗时={task.duration:.2f}s)")
+            # 在锁外计算duration用于日志
+            duration = time.time() - task.started_at
+            logger.info(f"任务成功: {task.name} (耗时={duration:.2f}s)")
 
         except Exception as e:
             # D6修复：使用锁检查是否已被标记为超时
@@ -275,8 +274,9 @@ class TaskEngine(ITaskEngine):
             task.retries += 1
 
             # D1修复：不可恢复的错误直接失败，不重试
-            unrecoverable_errors = (TypeError, ValueError, AttributeError, ImportError)
-            is_unrecoverable = isinstance(e, unrecoverable_errors) and "handler" in str(e).lower()
+            # handler为None或不可调用 → TypeError → 不可恢复
+            # handler正常但执行时TypeError（如参数错误）→ 可重试
+            is_unrecoverable = isinstance(e, TypeError) and (handler is None or not callable(handler))
 
             if is_unrecoverable:
                 # 不可恢复的错误，直接失败
@@ -327,9 +327,11 @@ class TaskEngine(ITaskEngine):
 
     def _trigger_callback(self, task: Task):
         """触发任务完成回调"""
-        if self._on_task_complete:
+        with self._lock:
+            callback = self._on_task_complete
+        if callback:
             try:
-                self._on_task_complete(task)
+                callback(task)
             except Exception as e:
                 logger.error(f"任务完成回调异常: {e}")
 
@@ -360,7 +362,8 @@ class TaskEngine(ITaskEngine):
 
     def on_complete(self, callback: Callable):
         """注册任务完成回调"""
-        self._on_task_complete = callback
+        with self._lock:
+            self._on_task_complete = callback
 
     @property
     def pending_count(self) -> int:
