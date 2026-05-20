@@ -105,48 +105,87 @@ class TaskEngine(ITaskEngine):
             futures[future] = task
 
         results = []
-        for future in as_completed(futures):
-            task = futures[future]
+        # D6修复：使用wait代替as_completed，实现真正的超时控制
+        from concurrent.futures import wait, FIRST_COMPLETED, ALL_COMPLETED
+        
+        start_time = time.time()
+        pending = set(futures.keys())
+        
+        while pending:
+            # 计算最小超时时间
+            min_timeout = float('inf')
+            for f in pending:
+                task = futures[f]
+                elapsed = time.time() - start_time
+                remaining = task.timeout - elapsed
+                min_timeout = min(min_timeout, remaining)
+            
+            if min_timeout <= 0:
+                # 所有剩余任务都已超时
+                for f in list(pending):
+                    task = futures[f]
+                    self._handle_timeout(task)
+                    results.append(task)
+                break
+            
+            # 等待任务完成，带超时
             try:
-                # 等待任务完成，带真正超时
-                result = future.result(timeout=task.timeout)
-                results.append(result)
-            except FutureTimeoutError:
-                # 任务执行超时
-                task.status = TaskStatus.TIMEOUT
-                task.error = f"任务执行超时 ({task.timeout}s)"
-                task.finished_at = time.time()
-                task.duration = max(0, task.finished_at - task.started_at)
-                with self._lock:
-                    self._total_failed += 1
-                    self._total_executed += 1
-                    if task.id in self._running:
-                        del self._running[task.id]
-                    self._completed.append(task)
-                    # F1修复：清理
-                    self._task_handlers.pop(task.id, None)
-                    self._cancel_events.pop(task.id, None)
-                self._trigger_callback(task)
-                results.append(task)
-                logger.warning(f"任务超时: {task.name}")
+                done, pending = wait(pending, timeout=min_timeout, return_when=FIRST_COMPLETED)
             except Exception as e:
-                task.status = TaskStatus.FAILED
-                task.error = str(e)
-                task.finished_at = time.time()
-                task.duration = max(0, task.finished_at - task.started_at)
-                with self._lock:
-                    self._total_failed += 1
-                    self._total_executed += 1
-                    if task.id in self._running:
-                        del self._running[task.id]
-                    self._completed.append(task)
-                    # F1修复：清理
-                    self._task_handlers.pop(task.id, None)
-                    self._cancel_events.pop(task.id, None)
-                self._trigger_callback(task)
-                results.append(task)
+                logger.error(f"等待任务异常: {e}")
+                break
+            
+            # 处理完成的任务
+            for f in done:
+                task = futures[f]
+                try:
+                    result = f.result(timeout=0)
+                    results.append(result)
+                except Exception as e:
+                    with self._lock:
+                        task.status = TaskStatus.FAILED
+                        task.error = str(e)
+                        task.finished_at = time.time()
+                        task.duration = max(0, task.finished_at - task.started_at)
+                        self._total_failed += 1
+                        self._total_executed += 1
+                        if task.id in self._running:
+                            del self._running[task.id]
+                        self._completed.append(task)
+                        self._task_handlers.pop(task.id, None)
+                        self._cancel_events.pop(task.id, None)
+                    self._trigger_callback(task)
+                    results.append(task)
+            
+            # 检查超时
+            current_time = time.time()
+            for f in list(pending):
+                task = futures[f]
+                if current_time - start_time >= task.timeout:
+                    self._handle_timeout(task)
+                    results.append(task)
+                    pending.discard(f)
 
         return results
+
+    def _handle_timeout(self, task: Task):
+        """处理任务超时"""
+        with self._lock:
+            if task.status == TaskStatus.TIMEOUT:
+                return  # 已经处理过
+            task.status = TaskStatus.TIMEOUT
+            task.error = f"任务执行超时 ({task.timeout}s)"
+            task.finished_at = time.time()
+            task.duration = max(0, task.finished_at - task.started_at)
+            self._total_failed += 1
+            self._total_executed += 1
+            if task.id in self._running:
+                del self._running[task.id]
+            self._completed.append(task)
+            self._task_handlers.pop(task.id, None)
+            self._cancel_events.pop(task.id, None)
+        self._trigger_callback(task)
+        logger.warning(f"任务超时: {task.name}")
 
     def _execute_wrapper(self, task: Task) -> Task:
         """执行包装器（用于线程池）- 捕获所有异常包括BaseException"""
@@ -156,6 +195,10 @@ class TaskEngine(ITaskEngine):
         try:
             return self._execute(task)
         except BaseException as e:
+            # C7修复：如果已被超时处理，不再重复计数
+            with self._lock:
+                if task.status == TaskStatus.TIMEOUT:
+                    return task
             # 捕获KeyboardInterrupt/SystemExit等，防止worker线程崩溃传播到主线程
             task.status = TaskStatus.FAILED
             task.error = f"[{type(e).__name__}] {str(e)}"
@@ -200,29 +243,61 @@ class TaskEngine(ITaskEngine):
             # 执行任务
             result = handler(*args, **kwargs)
 
+            # D6修复：使用锁检查是否已被标记为超时（后台线程仍在运行但主线程已超时）
+            with self._lock:
+                if task.status == TaskStatus.TIMEOUT:
+                    logger.warning(f"任务已完成但已被标记超时: {task.name}")
+                    return task
+
             # 再次检查取消状态
             if self._cancel_events.get(task.id, threading.Event()).is_set():
                 raise RuntimeError("任务执行期间被取消")
 
-            task.result = result
-            task.status = TaskStatus.SUCCESS
-            task.error = ""
-            self._total_success += 1
+            # D6修复：使用锁更新状态，防止竞态条件
+            with self._lock:
+                # 再次检查超时状态
+                if task.status == TaskStatus.TIMEOUT:
+                    return task
+                task.result = result
+                task.status = TaskStatus.SUCCESS
+                task.error = ""
+                self._total_success += 1
             logger.info(f"任务成功: {task.name} (耗时={task.duration:.2f}s)")
 
         except Exception as e:
+            # D6修复：使用锁检查是否已被标记为超时
+            with self._lock:
+                if task.status == TaskStatus.TIMEOUT:
+                    return task
+
             task.error = str(e)
             task.retries += 1
 
-            if task.retries < task.max_retries:
+            # D1修复：不可恢复的错误直接失败，不重试
+            unrecoverable_errors = (TypeError, ValueError, AttributeError, ImportError)
+            is_unrecoverable = isinstance(e, unrecoverable_errors) and "handler" in str(e).lower()
+
+            if is_unrecoverable:
+                # 不可恢复的错误，直接失败
+                with self._lock:
+                    if task.status == TaskStatus.TIMEOUT:
+                        return task
+                    task.status = TaskStatus.FAILED
+                    task.retries = task.max_retries  # 标记为已用完重试
+                    self._total_failed += 1
+                logger.error(f"任务不可恢复错误，直接失败: {task.name} - {e}")
+            elif task.retries < task.max_retries:
                 task.status = TaskStatus.RETRY
                 should_count = False  # RETRY不计数，等最终结果再计数
                 logger.warning(f"任务失败，准备重试 ({task.retries}/{task.max_retries}): {task.name} - {e}")
                 with self._lock:
                     self._queue.append(task)  # 重新入队
             else:
-                task.status = TaskStatus.FAILED
-                self._total_failed += 1
+                with self._lock:
+                    if task.status == TaskStatus.TIMEOUT:
+                        return task
+                    task.status = TaskStatus.FAILED
+                    self._total_failed += 1
                 logger.error(f"任务最终失败: {task.name} - {e}")
 
         finally:
@@ -231,6 +306,10 @@ class TaskEngine(ITaskEngine):
             with self._lock:
                 if task.id in self._running:
                     del self._running[task.id]
+
+                # C7修复：如果已被超时处理，不再重复计数
+                if task.status == TaskStatus.TIMEOUT:
+                    should_count = False
 
                 # 只有非RETRY状态才计入统计和触发回调
                 if should_count:
@@ -263,6 +342,9 @@ class TaskEngine(ITaskEngine):
                         self._cancel_events[task_id].set()
                     task.status = TaskStatus.CANCELLED
                     self._queue.remove(task)
+                    # E2修复：清理取消任务的资源
+                    self._task_handlers.pop(task_id, None)
+                    self._cancel_events.pop(task_id, None)
                     logger.info(f"任务已取消: {task.name}")
                     return True
 
@@ -270,6 +352,7 @@ class TaskEngine(ITaskEngine):
             if task_id in self._running:
                 if task_id in self._cancel_events:
                     self._cancel_events[task_id].set()
+                # 注意：运行中的任务不立即清理资源，等执行完成后清理
                 return True
 
         return False
@@ -318,12 +401,20 @@ class TaskEngine(ITaskEngine):
             self._shutdown = True
 
             if cancel_pending:
+                # E2修复：取消待处理任务时清理所有相关资源
+                cancelled_ids = []
                 for task in self._queue:
                     if task.id in self._cancel_events:
                         self._cancel_events[task.id].set()
                     task.status = TaskStatus.CANCELLED
+                    cancelled_ids.append(task.id)
                 logger.info(f"已取消 {len(self._queue)} 个待处理任务")
                 self._queue.clear()
+
+                # E2修复：清理取消任务的handler和cancel_event
+                for task_id in cancelled_ids:
+                    self._task_handlers.pop(task_id, None)
+                    self._cancel_events.pop(task_id, None)
 
         self._executor.shutdown(wait=wait)
         logger.info("执行引擎已关闭")

@@ -342,13 +342,19 @@ class Agent:
 
     def stop(self):
         """停止Agent（线程安全）"""
+        # E2修复：无论_running状态如何，都要清理资源
+        was_running = False
         with self._lock:
-            if not self._running:
-                return
-            self._running = False
-            self._shutdown_event.set()
+            if self._running:
+                was_running = True
+                self._running = False
+                self._shutdown_event.set()
 
-        logger.info("正在停止Agent...")
+        if not was_running:
+            # Agent未运行，但仍需清理资源
+            logger.info("Agent未运行，执行资源清理...")
+        else:
+            logger.info("正在停止Agent...")
 
         # P2修复：停止后台优化线程
         self._optimize_stop_event.set()
@@ -362,7 +368,7 @@ class Agent:
                     break
             time.sleep(0.2)
 
-        # 关闭执行引擎
+        # 关闭执行引擎（总是执行，清理所有资源）
         try:
             self.engine.shutdown(cancel_pending=True)
         except Exception as e:

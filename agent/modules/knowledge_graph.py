@@ -63,6 +63,8 @@ class KnowledgeGraph:
             # 启用WAL模式提高并发性能
             self._local.conn.execute("PRAGMA journal_mode=WAL")
             self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            # C1修复：增加busy_timeout，多Agent共享时等待锁释放
+            self._local.conn.execute("PRAGMA busy_timeout=5000")
         return self._local.conn
 
     @contextmanager
@@ -397,11 +399,21 @@ class KnowledgeGraph:
             }
 
     def vacuum(self):
-        """数据库优化（清理碎片）"""
-        conn = self._get_connection()
-        with self._lock:
-            conn.execute("VACUUM")
-            logger.info("数据库VACUUM完成")
+        """数据库优化（清理碎片）- C1修复：加锁并带重试"""
+        for attempt in range(3):
+            try:
+                conn = self._get_connection()
+                with self._lock:
+                    conn.execute("VACUUM")
+                logger.info("数据库VACUUM完成")
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    logger.warning(f"VACUUM数据库锁定，重试({attempt+1}/3)...")
+                    time.sleep(1 * (attempt + 1))
+                else:
+                    logger.error(f"数据库VACUUM失败: {e}")
+                    raise
 
     def close(self):
         """关闭数据库连接"""
