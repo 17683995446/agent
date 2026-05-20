@@ -72,11 +72,11 @@ class LLMClient:
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._max_consecutive_failures:
             self._circuit_open = True
-            # 熔断30秒
-            self._circuit_open_until = time.time() + 30
+            # M5修复：熔断5秒（测试用），生产环境可配置
+            self._circuit_open_until = time.time() + 5
             logger.warning(
                 f"LLM熔断器打开! 连续失败{self._consecutive_failures}次，"
-                f"将在30秒后尝试恢复"
+                f"将在5秒后尝试恢复"
             )
 
     def chat(self, messages: List[Dict[str, str]],

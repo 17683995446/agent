@@ -243,10 +243,11 @@ class TaskEngine(ITaskEngine):
             # 执行任务
             result = handler(*args, **kwargs)
 
-            # D6修复：使用锁检查是否已被标记为超时（后台线程仍在运行但主线程已超时）
+            # M4修复：即使已超时，也保存结果（任务实际已完成）
             with self._lock:
                 if task.status == TaskStatus.TIMEOUT:
-                    logger.warning(f"任务已完成但已被标记超时: {task.name}")
+                    logger.warning(f"任务已完成但已被标记超时，保存结果: {task.name}")
+                    task.result = result  # 保存实际结果
                     return task
 
             # 再次检查取消状态
