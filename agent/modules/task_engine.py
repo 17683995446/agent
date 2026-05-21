@@ -30,6 +30,8 @@ class TaskEngine(ITaskEngine):
         self._running: Dict[str, Task] = {}
         self._completed: List[Task] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="TaskWorker")
+        # C5修复：添加紧急执行器，用于主线程池被阻塞时的恢复
+        self._emergency_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="EmergencyWorker")
         self._total_executed = 0
         self._total_success = 0
         self._total_failed = 0
@@ -38,6 +40,9 @@ class TaskEngine(ITaskEngine):
         self._lock = threading.RLock()
         self._shutdown = False
         self._cancel_events: Dict[str, threading.Event] = {}
+        # C5修复：跟踪主线程池中提交的任务数（即使超时也计数，直到线程真正完成）
+        self._main_pool_submitted = 0  # 提交到主线程池的任务总数
+        self._main_pool_completed = 0  # 主线程池实际完成的任务数
         logger.debug(f"[__init__] TaskEngine初始化完成")
 
     def submit(self, name: str, handler: Callable, args: tuple = (), kwargs: Dict = None,
@@ -104,7 +109,7 @@ class TaskEngine(ITaskEngine):
         return results
 
     def run_batch(self, count: int = 3) -> List[Task]:
-        """并行执行一批任务（真正超时控制）"""
+        """并行执行一批任务（真正超时控制 + 线程池阻塞恢复）"""
         logger.debug(f"[run_batch] 开始批量执行 | requested={count}")
         with self._lock:
             if not self._queue:
@@ -115,11 +120,25 @@ class TaskEngine(ITaskEngine):
             batch = [self._queue.pop(0) for _ in range(batch_size)]
         logger.debug(f"[run_batch] 批次准备完成 | batch_size={batch_size}, queue_remaining={len(self._queue)}")
 
+        # C5修复：检测主线程池是否被阻塞
+        # 如果提交数 - 完成数 >= max_workers，说明所有worker都被阻塞
+        use_emergency = False
+        with self._lock:
+            blocked_in_pool = self._main_pool_submitted - self._main_pool_completed
+            if blocked_in_pool >= self.max_workers:
+                use_emergency = True
+                logger.debug(f"[run_batch] 检测到主线程池被阻塞 | submitted={self._main_pool_submitted}, completed={self._main_pool_completed}, blocked={blocked_in_pool}, max_workers={self.max_workers}, 使用紧急执行器")
+
         futures = {}
+        executor = self._emergency_executor if use_emergency else self._executor
         for task in batch:
-            future = self._executor.submit(self._execute_wrapper, task)
+            future = executor.submit(self._execute_wrapper, task)
             futures[future] = task
-        logger.debug(f"[run_batch] 已提交到线程池 | futures={len(futures)}")
+            # C5修复：跟踪主线程池提交数
+            if not use_emergency:
+                with self._lock:
+                    self._main_pool_submitted += 1
+        logger.debug(f"[run_batch] 已提交到线程池 | futures={len(futures)}, executor={'emergency' if use_emergency else 'main'}")
 
         results = []
         # D6修复：使用wait代替as_completed，实现真正的超时控制
@@ -246,6 +265,11 @@ class TaskEngine(ITaskEngine):
             logger.error(f"任务捕获极端异常: {task.name} - {type(e).__name__}: {e}")
             logger.debug(f"[_execute_wrapper] 极端异常处理完成 | id={task.id}, exception_type={type(e).__name__}")
             return task
+        finally:
+            # C5修复：无论成功/失败/超时，线程最终都会完成，更新计数
+            with self._lock:
+                self._main_pool_completed += 1
+                logger.debug(f"[_execute_wrapper] 线程完成 | id={task.id}, main_pool_completed={self._main_pool_completed}")
 
     def _execute(self, task: Task) -> Task:
         """执行单个任务"""
@@ -490,5 +514,7 @@ class TaskEngine(ITaskEngine):
                 logger.debug(f"[shutdown] 保留待处理任务 | pending={len(self._queue)}")
 
         self._executor.shutdown(wait=wait)
+        # C5修复：关闭紧急执行器
+        self._emergency_executor.shutdown(wait=wait)
         logger.info("执行引擎已关闭")
         logger.debug(f"[shutdown] 引擎关闭完成")
