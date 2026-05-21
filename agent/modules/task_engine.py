@@ -22,6 +22,7 @@ class TaskEngine(ITaskEngine):
     """任务执行引擎（增强版）"""
 
     def __init__(self, max_workers: int = 3, retry_limit: int = 3, timeout: int = 300):
+        logger.debug(f"[__init__] 初始化TaskEngine | max_workers={max_workers}, retry_limit={retry_limit}, timeout={timeout}")
         self.max_workers = max_workers
         self.retry_limit = retry_limit
         self.default_timeout = timeout
@@ -37,13 +38,18 @@ class TaskEngine(ITaskEngine):
         self._lock = threading.RLock()
         self._shutdown = False
         self._cancel_events: Dict[str, threading.Event] = {}
+        logger.debug(f"[__init__] TaskEngine初始化完成")
 
     def submit(self, name: str, handler: Callable, args: tuple = (), kwargs: Dict = None,
                task_type: str = "general", priority: int = 5, timeout: int = None,
                max_retries: int = None, metadata: Dict = None) -> Task:
         """提交新任务"""
+        logger.debug(f"[submit] 提交任务 | name={name}, task_type={task_type}, priority={priority}, timeout={timeout}, max_retries={max_retries}")
+        use_default_timeout = timeout is None or timeout <= 0
+        use_default_retries = max_retries is None
         with self._lock:
             if self._shutdown:
+                logger.debug(f"[submit] 引擎已关闭，拒绝提交")
                 raise RuntimeError("执行引擎已关闭，无法提交新任务")
 
             task = Task(
@@ -62,23 +68,30 @@ class TaskEngine(ITaskEngine):
             self._cancel_events[task.id] = threading.Event()
             self._queue.append(task)
             logger.info(f"任务已提交: [{task.task_type}] {task.name} (id={task.id}, 优先级={task.priority}, 超时={task.timeout}s)")
+            logger.debug(f"[submit] 任务入队完成 | id={task.id}, queue_size={len(self._queue)}, use_default_timeout={use_default_timeout}, use_default_retries={use_default_retries}")
             return task
 
     def submit_many(self, tasks: List[Dict]) -> List[Task]:
         """批量提交任务"""
-        return [self.submit(**t) for t in tasks]
+        logger.debug(f"[submit_many] 批量提交 | count={len(tasks)}")
+        result = [self.submit(**t) for t in tasks]
+        logger.debug(f"[submit_many] 批量提交完成 | submitted={len(result)}")
+        return result
 
     def run_next(self) -> Optional[Task]:
         """执行下一个任务（优先级排序）"""
         with self._lock:
             if not self._queue:
+                logger.debug(f"[run_next] 队列为空，无任务可执行")
                 return None
             self._queue.sort(key=lambda t: t.priority)
             task = self._queue.pop(0)
+        logger.debug(f"[run_next] 取出任务 | id={task.id}, name={task.name}, queue_remaining={len(self._queue)}")
         return self._execute(task)
 
     def run_all_pending(self) -> List[Task]:
         """执行所有待处理任务"""
+        logger.debug(f"[run_all_pending] 开始执行所有待处理任务")
         results = []
         while True:
             with self._lock:
@@ -87,21 +100,26 @@ class TaskEngine(ITaskEngine):
             task = self.run_next()
             if task:
                 results.append(task)
+        logger.debug(f"[run_all_pending] 执行完成 | count={len(results)}")
         return results
 
     def run_batch(self, count: int = 3) -> List[Task]:
         """并行执行一批任务（真正超时控制）"""
+        logger.debug(f"[run_batch] 开始批量执行 | requested={count}")
         with self._lock:
             if not self._queue:
+                logger.debug(f"[run_batch] 队列为空，返回空列表")
                 return []
             self._queue.sort(key=lambda t: t.priority)
             batch_size = min(count, len(self._queue))
             batch = [self._queue.pop(0) for _ in range(batch_size)]
+        logger.debug(f"[run_batch] 批次准备完成 | batch_size={batch_size}, queue_remaining={len(self._queue)}")
 
         futures = {}
         for task in batch:
             future = self._executor.submit(self._execute_wrapper, task)
             futures[future] = task
+        logger.debug(f"[run_batch] 已提交到线程池 | futures={len(futures)}")
 
         results = []
         # D6修复：使用wait代替as_completed，实现真正的超时控制
@@ -119,6 +137,7 @@ class TaskEngine(ITaskEngine):
             
             if min_timeout <= 0:
                 # 所有剩余任务都已超时
+                logger.debug(f"[run_batch] 所有剩余任务超时 | pending={len(pending)}")
                 for f in list(pending):
                     task = futures[f]
                     self._handle_timeout(task)
@@ -128,8 +147,10 @@ class TaskEngine(ITaskEngine):
             # 等待任务完成，带超时
             try:
                 done, pending = wait(pending, timeout=min_timeout, return_when=FIRST_COMPLETED)
+                logger.debug(f"[run_batch] wait返回 | done={len(done)}, pending={len(pending)}")
             except Exception as e:
                 logger.error(f"等待任务异常: {e}")
+                logger.debug(f"[run_batch] wait异常 | error={e}")
                 break
             
             # 处理完成的任务
@@ -138,6 +159,7 @@ class TaskEngine(ITaskEngine):
                 try:
                     result = f.result(timeout=0)
                     results.append(result)
+                    logger.debug(f"[run_batch] 任务完成 | id={task.id}, status={task.status}")
                 except Exception as e:
                     with self._lock:
                         task.status = TaskStatus.FAILED
@@ -153,6 +175,7 @@ class TaskEngine(ITaskEngine):
                         self._cancel_events.pop(task.id, None)
                     self._trigger_callback(task)
                     results.append(task)
+                    logger.debug(f"[run_batch] 任务future异常 | id={task.id}, error={e}")
             
             # 检查超时
             current_time = time.time()
@@ -162,13 +185,17 @@ class TaskEngine(ITaskEngine):
                     self._handle_timeout(task)
                     results.append(task)
                     pending.discard(f)
+                    logger.debug(f"[run_batch] 任务超时 | id={task.id}, timeout={task.timeout}s")
 
+        logger.debug(f"[run_batch] 批量执行完成 | results={len(results)}")
         return results
 
     def _handle_timeout(self, task: Task):
         """处理任务超时"""
+        logger.debug(f"[_handle_timeout] 处理超时 | id={task.id}, name={task.name}, current_status={task.status}")
         with self._lock:
             if task.status == TaskStatus.TIMEOUT:
+                logger.debug(f"[_handle_timeout] 已处理过，跳过 | id={task.id}")
                 return  # 已经处理过
             task.status = TaskStatus.TIMEOUT
             task.error = f"任务执行超时 ({task.timeout}s)"
@@ -183,18 +210,23 @@ class TaskEngine(ITaskEngine):
             self._cancel_events.pop(task.id, None)
         self._trigger_callback(task)
         logger.warning(f"任务超时: {task.name}")
+        logger.debug(f"[_handle_timeout] 超时处理完成 | id={task.id}")
 
     def _execute_wrapper(self, task: Task) -> Task:
         """执行包装器（用于线程池）- 捕获所有异常包括BaseException"""
+        logger.debug(f"[_execute_wrapper] 开始执行包装 | id={task.id}, name={task.name}")
         # F4修复：确保started_at已设置
         if not task.started_at:
             task.started_at = time.time()
         try:
-            return self._execute(task)
+            result = self._execute(task)
+            logger.debug(f"[_execute_wrapper] 执行完成 | id={task.id}, status={task.status}")
+            return result
         except BaseException as e:
             # C7修复：如果已被超时处理，不再重复计数
             with self._lock:
                 if task.status == TaskStatus.TIMEOUT:
+                    logger.debug(f"[_execute_wrapper] 已超时，跳过异常处理 | id={task.id}")
                     return task
             # 捕获KeyboardInterrupt/SystemExit等，防止worker线程崩溃传播到主线程
             task.status = TaskStatus.FAILED
@@ -212,10 +244,12 @@ class TaskEngine(ITaskEngine):
                 self._cancel_events.pop(task.id, None)
             self._trigger_callback(task)
             logger.error(f"任务捕获极端异常: {task.name} - {type(e).__name__}: {e}")
+            logger.debug(f"[_execute_wrapper] 极端异常处理完成 | id={task.id}, exception_type={type(e).__name__}")
             return task
 
     def _execute(self, task: Task) -> Task:
         """执行单个任务"""
+        logger.debug(f"[_execute] 开始执行 | id={task.id}, name={task.name}")
         task.status = TaskStatus.RUNNING
         task.started_at = time.time()
         with self._lock:
@@ -225,36 +259,43 @@ class TaskEngine(ITaskEngine):
             handler, args, kwargs = handler_info
 
         logger.info(f"开始执行任务: [{task.task_type}] {task.name} (id={task.id}, 超时={task.timeout}s)")
+        logger.debug(f"[_execute] handler信息 | handler_type={type(handler).__name__ if handler else 'None'}, args={args}, kwargs_keys={list(kwargs.keys()) if kwargs else []}")
 
         should_count = True  # 是否应该计入统计和触发回调
 
         try:
             # 检查是否已取消
             if self._cancel_events.get(task.id, threading.Event()).is_set():
+                logger.debug(f"[_execute] 任务已取消（执行前检查） | id={task.id}")
                 raise RuntimeError("任务已被取消")
 
             # 防御：handler为None或不可调用
             if handler is None or not callable(handler):
+                logger.debug(f"[_execute] handler不可调用 | handler_type={type(handler).__name__ if handler else 'None'}")
                 raise TypeError(f"任务handler不可调用: {type(handler)}")
 
             # 执行任务
             result = handler(*args, **kwargs)
+            logger.debug(f"[_execute] handler执行完成 | id={task.id}")
 
             # M4修复：即使已超时，也保存结果（任务实际已完成）
             with self._lock:
                 if task.status == TaskStatus.TIMEOUT:
                     logger.warning(f"任务已完成但已被标记超时，保存结果: {task.name}")
+                    logger.debug(f"[_execute] 任务已完成但已超时 | id={task.id}")
                     task.result = result  # 保存实际结果
                     return task
 
             # 再次检查取消状态
             if self._cancel_events.get(task.id, threading.Event()).is_set():
+                logger.debug(f"[_execute] 任务执行期间被取消 | id={task.id}")
                 raise RuntimeError("任务执行期间被取消")
 
             # D6修复：使用锁更新状态，防止竞态条件
             with self._lock:
                 # 再次检查超时状态
                 if task.status == TaskStatus.TIMEOUT:
+                    logger.debug(f"[_execute] 锁内再次检查发现已超时 | id={task.id}")
                     return task
                 task.result = result
                 task.status = TaskStatus.SUCCESS
@@ -263,15 +304,18 @@ class TaskEngine(ITaskEngine):
             # 在锁外计算duration用于日志
             duration = time.time() - task.started_at
             logger.info(f"任务成功: {task.name} (耗时={duration:.2f}s)")
+            logger.debug(f"[_execute] 任务成功 | id={task.id}, duration={duration:.2f}s")
 
         except Exception as e:
             # D6修复：使用锁检查是否已被标记为超时
             with self._lock:
                 if task.status == TaskStatus.TIMEOUT:
+                    logger.debug(f"[_execute] 异常处理中发现已超时 | id={task.id}")
                     return task
 
             task.error = str(e)
             task.retries += 1
+            logger.debug(f"[_execute] 任务异常 | id={task.id}, error={e}, retries={task.retries}/{task.max_retries}")
 
             # D1修复：不可恢复的错误直接失败，不重试
             # handler为None或不可调用 → TypeError → 不可恢复
@@ -280,6 +324,7 @@ class TaskEngine(ITaskEngine):
 
             if is_unrecoverable:
                 # 不可恢复的错误，直接失败
+                logger.debug(f"[_execute] 不可恢复错误 | id={task.id}, error={e}")
                 with self._lock:
                     if task.status == TaskStatus.TIMEOUT:
                         return task
@@ -288,12 +333,14 @@ class TaskEngine(ITaskEngine):
                     self._total_failed += 1
                 logger.error(f"任务不可恢复错误，直接失败: {task.name} - {e}")
             elif task.retries < task.max_retries:
+                logger.debug(f"[_execute] 准备重试 | id={task.id}, retries={task.retries}/{task.max_retries}")
                 task.status = TaskStatus.RETRY
                 should_count = False  # RETRY不计数，等最终结果再计数
                 logger.warning(f"任务失败，准备重试 ({task.retries}/{task.max_retries}): {task.name} - {e}")
                 with self._lock:
                     self._queue.append(task)  # 重新入队
             else:
+                logger.debug(f"[_execute] 重试次数用尽，最终失败 | id={task.id}, retries={task.retries}/{task.max_retries}")
                 with self._lock:
                     if task.status == TaskStatus.TIMEOUT:
                         return task
@@ -311,6 +358,7 @@ class TaskEngine(ITaskEngine):
                 # C7修复：如果已被超时处理，不再重复计数
                 if task.status == TaskStatus.TIMEOUT:
                     should_count = False
+                    logger.debug(f"[_execute] finally中发现已超时，不计数 | id={task.id}")
 
                 # 只有非RETRY状态才计入统计和触发回调
                 if should_count:
@@ -319,6 +367,9 @@ class TaskEngine(ITaskEngine):
                     # F1修复：清理已完成任务handler和cancel_event
                     self._task_handlers.pop(task.id, None)
                     self._cancel_events.pop(task.id, None)
+                    logger.debug(f"[_execute] 计入统计 | id={task.id}, status={task.status}, total_executed={self._total_executed}")
+                else:
+                    logger.debug(f"[_execute] 不计入统计 | id={task.id}, status={task.status}, should_count={should_count}")
 
             if should_count:
                 self._trigger_callback(task)
@@ -327,16 +378,22 @@ class TaskEngine(ITaskEngine):
 
     def _trigger_callback(self, task: Task):
         """触发任务完成回调"""
+        logger.debug(f"[_trigger_callback] 触发回调 | id={task.id}, status={task.status}")
         with self._lock:
             callback = self._on_task_complete
         if callback:
             try:
                 callback(task)
+                logger.debug(f"[_trigger_callback] 回调完成 | id={task.id}")
             except Exception as e:
                 logger.error(f"任务完成回调异常: {e}")
+                logger.debug(f"[_trigger_callback] 回调异常 | id={task.id}, error={e}")
+        else:
+            logger.debug(f"[_trigger_callback] 无回调注册 | id={task.id}")
 
     def cancel_task(self, task_id: str) -> bool:
         """取消指定任务"""
+        logger.debug(f"[cancel_task] 取消请求 | task_id={task_id}")
         with self._lock:
             # 检查是否在队列中
             for task in self._queue:
@@ -349,6 +406,7 @@ class TaskEngine(ITaskEngine):
                     self._task_handlers.pop(task_id, None)
                     self._cancel_events.pop(task_id, None)
                     logger.info(f"任务已取消: {task.name}")
+                    logger.debug(f"[cancel_task] 从队列中取消 | task_id={task_id}, name={task.name}")
                     return True
 
             # 检查是否正在运行
@@ -356,14 +414,18 @@ class TaskEngine(ITaskEngine):
                 if task_id in self._cancel_events:
                     self._cancel_events[task_id].set()
                 # 注意：运行中的任务不立即清理资源，等执行完成后清理
+                logger.debug(f"[cancel_task] 运行中任务设置取消标志 | task_id={task_id}")
                 return True
 
+        logger.debug(f"[cancel_task] 任务不存在 | task_id={task_id}")
         return False
 
     def on_complete(self, callback: Callable):
         """注册任务完成回调"""
+        logger.debug(f"[on_complete] 注册回调 | callback={callback}")
         with self._lock:
             self._on_task_complete = callback
+        logger.debug(f"[on_complete] 回调注册完成")
 
     @property
     def pending_count(self) -> int:
@@ -396,11 +458,15 @@ class TaskEngine(ITaskEngine):
         """清理已完成任务记录（防止内存无限增长）"""
         with self._lock:
             if len(self._completed) > keep:
+                logger.debug(f"[clear_completed] 清理 | current={len(self._completed)}, keep={keep}")
                 self._completed = self._completed[-keep:]
                 logger.debug(f"已清理完成任务记录，保留最近{keep}条")
+            else:
+                logger.debug(f"[clear_completed] 无需清理 | current={len(self._completed)}, keep={keep}")
 
     def shutdown(self, wait: bool = True, cancel_pending: bool = False):
         """关闭执行引擎"""
+        logger.debug(f"[shutdown] 关闭引擎 | wait={wait}, cancel_pending={cancel_pending}")
         with self._lock:
             self._shutdown = True
 
@@ -413,12 +479,16 @@ class TaskEngine(ITaskEngine):
                     task.status = TaskStatus.CANCELLED
                     cancelled_ids.append(task.id)
                 logger.info(f"已取消 {len(self._queue)} 个待处理任务")
+                logger.debug(f"[shutdown] 取消待处理任务 | count={len(self._queue)}")
                 self._queue.clear()
 
                 # E2修复：清理取消任务的handler和cancel_event
                 for task_id in cancelled_ids:
                     self._task_handlers.pop(task_id, None)
                     self._cancel_events.pop(task_id, None)
+            else:
+                logger.debug(f"[shutdown] 保留待处理任务 | pending={len(self._queue)}")
 
         self._executor.shutdown(wait=wait)
         logger.info("执行引擎已关闭")
+        logger.debug(f"[shutdown] 引擎关闭完成")

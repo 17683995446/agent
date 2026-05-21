@@ -15,6 +15,7 @@ class LLMClient:
     """统一LLM客户端（增强版）"""
 
     def __init__(self, config):
+        logger.debug(f"[__init__] 初始化LLMClient | provider={config.provider}")
         self.config = config
         self._client = None
         self._consecutive_failures = 0
@@ -23,6 +24,7 @@ class LLMClient:
         self._circuit_open_until = 0
         self._lock = threading.Lock()
         self._init_client()
+        logger.debug(f"[__init__] LLMClient初始化完成 | client={'None' if self._client is None else type(self._client).__name__}")
 
     def _init_client(self):
         """初始化LLM客户端"""
@@ -56,13 +58,16 @@ class LLMClient:
         """检查熔断器是否打开"""
         with self._lock:
             if not self._circuit_open:
+                logger.debug(f"[_is_circuit_open] 熔断器关闭（正常）")
                 return False
             if time.time() > self._circuit_open_until:
                 # 熔断恢复期，尝试半开
                 self._circuit_open = False
                 self._consecutive_failures = 0
                 logger.info("熔断器半开，尝试恢复LLM调用")
+                logger.debug(f"[_is_circuit_open] 熔断器半开恢复")
                 return False
+            logger.debug(f"[_is_circuit_open] 熔断器打开 | remaining={self._circuit_open_until - time.time():.1f}s")
             return True
 
     def _record_success(self):
@@ -70,6 +75,7 @@ class LLMClient:
         with self._lock:
             self._consecutive_failures = 0
             self._circuit_open = False
+        logger.debug(f"[_record_success] 成功记录 | consecutive_failures=0, circuit_open=False")
 
     def _record_failure(self):
         """记录失败，检查是否需要熔断"""
@@ -83,6 +89,9 @@ class LLMClient:
                     f"LLM熔断器打开! 连续失败{self._consecutive_failures}次，"
                     f"将在5秒后尝试恢复"
                 )
+                logger.debug(f"[_record_failure] 熔断触发 | consecutive_failures={self._consecutive_failures}")
+            else:
+                logger.debug(f"[_record_failure] 失败记录 | consecutive_failures={self._consecutive_failures}/{self._max_consecutive_failures}")
 
     def chat(self, messages: List[Dict[str, str]],
              system_prompt: str = "", temperature: float = None,
@@ -107,11 +116,15 @@ class LLMClient:
             full_messages.append({"role": "system", "content": system_prompt})
         full_messages.extend(messages)
 
+        logger.debug(f"[chat] 请求 | messages_count={len(full_messages)}, temp={temp}, tokens={tokens}")
+
         if self._client is None or self._is_circuit_open():
+            logger.debug(f"[chat] 使用模拟模式 | client_is_none={self._client is None}")
             return self._mock_response(full_messages)
 
         try:
             if self.config.provider == "openai" and self._client != "ollama":
+                logger.debug(f"[chat] 使用OpenAI模式 | model={self.config.model}")
                 response = self._client.chat.completions.create(
                     model=self.config.model,
                     messages=full_messages,
@@ -120,16 +133,20 @@ class LLMClient:
                     **kwargs
                 )
                 self._record_success()
+                logger.debug(f"[chat] OpenAI响应成功 | response_len={len(response.choices[0].message.content)}")
                 return response.choices[0].message.content
 
             elif self.config.provider == "ollama":
+                logger.debug(f"[chat] 使用Ollama模式 | model={self.config.model}")
                 result = self._ollama_chat(full_messages, temp, tokens)
                 self._record_success()
+                logger.debug(f"[chat] Ollama响应成功 | response_len={len(result)}")
                 return result
 
         except Exception as e:
             self._record_failure()
             logger.error(f"LLM请求失败: {e}")
+            logger.debug(f"[chat] 请求异常 | error={e}, 降级到模拟模式")
             return self._mock_response(full_messages)
 
     def _ollama_chat(self, messages, temperature, max_tokens) -> str:
@@ -153,7 +170,7 @@ class LLMClient:
     def _mock_response(self, messages: List[Dict]) -> str:
         """无LLM时的模拟回复"""
         last_msg = messages[-1]["content"] if messages else ""
-        logger.debug(f"[模拟模式] 收到请求: {last_msg[:100]}...")
+        logger.debug(f"[_mock_response] 模拟模式 | last_msg={last_msg[:100]}...")
 
         # 基于关键词的模拟回复 - 确保返回结构符合各调用方期望
         if "优化" in last_msg or "改进" in last_msg or "分析" in last_msg:
@@ -217,6 +234,7 @@ class LLMClient:
 
         始终返回Dict，即使解析失败也返回安全的fallback结构
         """
+        logger.debug(f"[analyze_json] 请求 | prompt_len={len(prompt)}, system_prompt={bool(system_prompt)}")
         response = self.chat(
             messages=[{"role": "user", "content": prompt}],
             system_prompt=system_prompt
@@ -226,20 +244,25 @@ class LLMClient:
             text = response.strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0]
+                logger.debug(f"[analyze_json] 提取```json代码块")
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0]
+                logger.debug(f"[analyze_json] 提取```代码块")
 
             result = json.loads(text.strip())
 
             # 确保返回的是字典
             if isinstance(result, dict):
+                logger.debug(f"[analyze_json] 解析成功 | keys={list(result.keys())}")
                 return result
             else:
                 logger.warning(f"LLM返回了非字典类型: {type(result)}")
+                logger.debug(f"[analyze_json] 非字典类型 | type={type(result).__name__}")
                 return {"raw_response": response, "parsed": True, "value": result}
 
         except (json.JSONDecodeError, IndexError, AttributeError) as e:
             logger.warning(f"JSON解析失败: {e}, 原始回复: {response[:200]}")
+            logger.debug(f"[analyze_json] 解析失败 | error={e}")
             return {"raw_response": response, "parsed": False, "error": str(e)}
 
     @property

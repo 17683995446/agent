@@ -44,6 +44,7 @@ class KnowledgeGraph:
     """知识图谱 - SQLite实现（线程安全 + 连接池）"""
 
     def __init__(self, db_path: str = "data/knowledge.db"):
+        logger.debug(f"[__init__] 初始化KnowledgeGraph | db_path={db_path}")
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self._lock = threading.RLock()  # 可重入锁
@@ -51,10 +52,12 @@ class KnowledgeGraph:
         self._all_connections = []  # 跟踪所有连接
         self._connections_lock = threading.Lock()
         self._init_db()
+        logger.debug(f"[__init__] KnowledgeGraph初始化完成 | db_path={db_path}")
 
     def _get_connection(self) -> sqlite3.Connection:
         """获取线程专属连接"""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
+            logger.debug(f"[_get_connection] 创建新连接")
             conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
@@ -70,6 +73,7 @@ class KnowledgeGraph:
             self._local.conn = conn
             with self._connections_lock:
                 self._all_connections.append(conn)
+            logger.debug(f"[_get_connection] 新连接创建完成 | total_connections={len(self._all_connections)}")
         return self._local.conn
 
     @contextmanager
@@ -87,6 +91,7 @@ class KnowledgeGraph:
 
     def _init_db(self):
         """初始化数据库表结构"""
+        logger.debug(f"[_init_db] 开始初始化数据库表结构")
         conn = self._get_connection()
         with self._lock:
             c = conn.cursor()
@@ -161,11 +166,13 @@ class KnowledgeGraph:
 
             conn.commit()
             logger.info(f"知识图谱初始化完成: {self.db_path}")
+            logger.debug(f"[_init_db] 数据库表结构初始化完成 | tables=nodes,edges,task_logs,strategies")
 
     # ========== 节点操作 ==========
 
     def add_node(self, node: KnowledgeNode) -> int:
         """添加知识节点（线程安全）"""
+        logger.debug(f"[add_node] 添加节点 | category={node.category}, title={node.title}")
         now = time.time()
         node.created_at = now
         node.updated_at = now
@@ -185,17 +192,21 @@ class KnowledgeGraph:
 
     def get_node(self, node_id: int) -> Optional[KnowledgeNode]:
         """获取知识节点"""
+        logger.debug(f"[get_node] 查询节点 | node_id={node_id}")
         conn = self._get_connection()
         with self._lock:
             c = conn.cursor()
             c.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = c.fetchone()
             if row:
+                logger.debug(f"[get_node] 查询成功 | node_id={node_id}, title={dict(row)['title']}")
                 return KnowledgeNode(**dict(row))
+            logger.debug(f"[get_node] 节点不存在 | node_id={node_id}")
             return None
 
     def search_nodes(self, query: str, category: str = "", limit: int = 10) -> List[KnowledgeNode]:
         """搜索知识节点（关键词匹配）"""
+        logger.debug(f"[search_nodes] 搜索 | query={query}, category={category}, limit={limit}")
         conn = self._get_connection()
         with self._lock:
             c = conn.cursor()
@@ -216,7 +227,9 @@ class KnowledgeGraph:
             params.append(limit)
 
             c.execute(sql, params)
-            return [KnowledgeNode(**dict(row)) for row in c.fetchall()]
+            results = [KnowledgeNode(**dict(row)) for row in c.fetchall()]
+        logger.debug(f"[search_nodes] 搜索完成 | results={len(results)}")
+        return results
 
     def get_related_nodes(self, node_id: int, relation: str = "", depth: int = 1) -> List[KnowledgeNode]:
         """获取关联节点"""
@@ -254,10 +267,14 @@ class KnowledgeGraph:
 
     def delete_node(self, node_id: int):
         """删除节点及其关系"""
+        logger.debug(f"[delete_node] 删除节点 | node_id={node_id}")
         with self._transaction() as conn:
             c = conn.cursor()
             c.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+            edges_deleted = c.rowcount
             c.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            nodes_deleted = c.rowcount
+        logger.debug(f"[delete_node] 删除完成 | node_id={node_id}, edges_deleted={edges_deleted}, nodes_deleted={nodes_deleted}")
 
     # ========== 关系操作 ==========
 
@@ -356,6 +373,7 @@ class KnowledgeGraph:
     def store_experience(self, title: str, content: str, category: str = "experience",
                          tags: str = "", importance: float = 0.5, related_to: Optional[int] = None) -> int:
         """存储一条经验，自动关联相关节点"""
+        logger.debug(f"[store_experience] 存储经验 | title={title}, category={category}, importance={importance}")
         node = KnowledgeNode(
             category=category,
             title=title,
@@ -367,11 +385,14 @@ class KnowledgeGraph:
 
         if related_to:
             self.add_edge(related_to, node_id, "derived_from")
+            logger.debug(f"[store_experience] 已关联 | source_id={related_to}, target_id={node_id}")
 
+        logger.debug(f"[store_experience] 存储完成 | node_id={node_id}")
         return node_id
 
     def query_experience(self, query: str, limit: int = 5) -> List[KnowledgeNode]:
         """查询相关经验（P4修复：查询后自动更新usage_count）"""
+        logger.debug(f"[query_experience] 查询经验 | query={query}, limit={limit}")
         results = self.search_nodes(query, category="experience", limit=limit)
         # P4修复：每次查询经验时更新usage_count，形成学习反馈闭环
         for node in results:
@@ -379,6 +400,7 @@ class KnowledgeGraph:
                 self.update_node_usage(node.id, success=True)
             except Exception:
                 pass
+        logger.debug(f"[query_experience] 查询完成 | results={len(results)}")
         return results
 
     def get_all_knowledge_summary(self) -> Dict[str, Any]:
@@ -424,6 +446,7 @@ class KnowledgeGraph:
 
     def close(self):
         """关闭数据库连接"""
+        logger.debug(f"[close] 关闭知识图谱连接 | total_connections={len(self._all_connections)}")
         # 关闭所有线程的连接
         with self._connections_lock:
             for conn in self._all_connections:
@@ -437,6 +460,7 @@ class KnowledgeGraph:
 
     def cleanup_old_knowledge(self, max_age_seconds: float = 3600, min_importance: float = 0.2, keep_recent_logs: int = 100) -> int:
         """清理过时知识（公共接口）"""
+        logger.debug(f"[cleanup_old_knowledge] 开始清理 | max_age={max_age_seconds}, min_importance={min_importance}, keep_logs={keep_recent_logs}")
         cleaned = 0
         with self._transaction() as conn:
             c = conn.cursor()
@@ -449,4 +473,6 @@ class KnowledgeGraph:
             deactivated = c.rowcount
             if deactivated > 0:
                 logger.info(f"停用了{deactivated}个低效策略")
+                logger.debug(f"[cleanup_old_knowledge] 停用低效策略 | count={deactivated}")
+        logger.debug(f"[cleanup_old_knowledge] 清理完成 | cleaned={cleaned}")
         return cleaned

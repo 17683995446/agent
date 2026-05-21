@@ -41,10 +41,13 @@ class Optimizer:
         self._optimization_count = 0
         self._last_optimization_time = 0
         self._lock = __import__('threading').Lock()  # 线程安全
+        logger.debug(f"[__init__] Optimizer初始化完成")
 
     def reflect_on_tasks(self, tasks: List) -> Dict[str, Any]:
         """对一批已完成任务进行反思分析"""
+        logger.debug(f"[reflect_on_tasks] 开始反思 | tasks_count={len(tasks)}")
         if not tasks:
+            logger.debug(f"[reflect_on_tasks] 无任务，跳过反思")
             return {"action": "skip", "reason": "没有任务需要反思"}
 
         with self._lock:
@@ -52,6 +55,7 @@ class Optimizer:
 
     def _reflect_internal(self, tasks: List) -> Dict[str, Any]:
         """反思分析内部实现"""
+        logger.debug(f"[_reflect_internal] 开始内部反思 | tasks={len(tasks)}")
         # 准备任务摘要
         task_summaries = []
         for t in tasks:
@@ -63,6 +67,7 @@ class Optimizer:
                 "error": (getattr(t, 'error', '') or '')[:200],
                 "retries": getattr(t, 'retries', 0),
             })
+        logger.debug(f"[_reflect_internal] 任务摘要准备完成 | summaries={len(task_summaries)}")
 
         # 查询相关经验
         task_types = list(set(ts.get("type", "") for ts in task_summaries))
@@ -76,6 +81,8 @@ class Optimizer:
                     related_exp.append({"title": n.title, "content": n.content[:200]})
             except Exception as e:
                 logger.error(f"查询经验失败: {e}")
+                logger.debug(f"[_reflect_internal] 查询经验失败 | type={tt}, error={e}")
+        logger.debug(f"[_reflect_internal] 相关经验获取完成 | experiences={len(related_exp)}")
 
         # 调用LLM进行反思
         prompt = f"""请分析以下任务执行结果，给出优化建议。
@@ -103,14 +110,18 @@ class Optimizer:
 
         system_prompt = "你是一个AI Agent的自我反思优化模块。你的任务是分析任务执行结果，提取经验教训，提出改进策略。始终返回有效的JSON格式。"
 
+        logger.debug(f"[_reflect_internal] 调用LLM分析")
         result = self.llm.analyze_json(prompt, system_prompt)
+        logger.debug(f"[_reflect_internal] LLM分析完成 | result_type={type(result).__name__}")
 
         # 防御性：确保result是字典
         if not isinstance(result, dict):
+            logger.debug(f"[_reflect_internal] LLM返回非字典，使用fallback")
             result = {"raw_response": str(result), "parsed": False}
 
         # 存储新经验到知识图谱（防御性处理）
         experiences = _safe_list(result.get("experience_to_store"))
+        logger.debug(f"[_reflect_internal] 待存储经验 | count={len(experiences)}")
         for exp in experiences:
             if not isinstance(exp, dict):
                 continue
@@ -125,9 +136,11 @@ class Optimizer:
                 logger.info(f"存储新经验: {exp.get('title', 'N/A')}")
             except Exception as e:
                 logger.error(f"存储经验失败: {e}")
+                logger.debug(f"[_reflect_internal] 存储经验失败 | title={exp.get('title', 'N/A')}, error={e}")
 
         # 存储新策略（防御性处理）
         strategies = _safe_list(result.get("new_strategies"))
+        logger.debug(f"[_reflect_internal] 待存储策略 | count={len(strategies)}")
         for strat in strategies:
             if not isinstance(strat, dict):
                 continue
@@ -140,6 +153,7 @@ class Optimizer:
                 logger.info(f"添加新策略: {strat.get('name', 'N/A')}")
             except Exception as e:
                 logger.error(f"存储策略失败: {e}")
+                logger.debug(f"[_reflect_internal] 存储策略失败 | name={strat.get('name', 'N/A')}, error={e}")
 
         # 记录任务日志
         suggestions = _safe_list(result.get("suggestions"))
@@ -157,24 +171,30 @@ class Optimizer:
                 )
             except Exception as e:
                 logger.error(f"记录任务日志失败: {e}")
+                logger.debug(f"[_reflect_internal] 记录任务日志失败 | task_id={getattr(t, 'id', 'unknown')}, error={e}")
 
         self._optimization_count += 1
         self._last_optimization_time = time.time()
 
         logger.info(f"反思完成: {result.get('overall_assessment', 'N/A')}")
+        logger.debug(f"[_reflect_internal] 反思完成 | optimization_count={self._optimization_count}")
         return result
 
     def get_optimization_advice(self, task_type: str = "") -> Dict[str, Any]:
         """获取优化建议（在执行任务前调用）"""
+        logger.debug(f"[get_optimization_advice] 获取建议 | task_type={task_type}")
         try:
             strategies = self.kg.get_active_strategies(limit=5)
             experiences = self.kg.query_experience(task_type, limit=5) if task_type else []
             failures = self.kg.get_recent_failures(limit=3)
+            logger.debug(f"[get_optimization_advice] 数据获取完成 | strategies={len(strategies)}, experiences={len(experiences)}, failures={len(failures)}")
         except Exception as e:
             logger.error(f"获取优化数据失败: {e}")
+            logger.debug(f"[get_optimization_advice] 数据获取异常 | error={e}")
             return {"advice": "数据获取失败，跳过优化", "has_advice": False}
 
         if not strategies and not experiences and not failures:
+            logger.debug(f"[get_optimization_advice] 无优化数据")
             return {"advice": "暂无优化建议，继续执行", "has_advice": False}
 
         # 用LLM综合分析
@@ -210,6 +230,7 @@ class Optimizer:
 
     def analyze_failure(self, task) -> Dict[str, Any]:
         """深度分析失败任务"""
+        logger.debug(f"[analyze_failure] 分析失败 | task_name={getattr(task, 'name', 'unknown')}, task_status={getattr(task, 'status', 'unknown')}")
         prompt = f"""分析以下任务失败原因，并提供修复方案。
 
 任务名称: {getattr(task, 'name', 'unknown')}
@@ -227,8 +248,10 @@ class Optimizer:
 }}"""
 
         result = self.llm.analyze_json(prompt, "你是错误分析专家。分析失败原因并提供修复方案。返回JSON。")
+        logger.debug(f"[analyze_failure] LLM分析完成 | result_type={type(result).__name__}")
 
         if not isinstance(result, dict):
+            logger.debug(f"[analyze_failure] LLM返回非字典，使用fallback")
             result = {"root_cause": "分析失败", "fix_suggestion": "N/A"}
 
         # 存储错误经验
@@ -242,8 +265,10 @@ class Optimizer:
                 tags=f"error,{getattr(task, 'task_type', 'unknown')}",
                 importance=0.8,
             )
+            logger.debug(f"[analyze_failure] 错误经验已存储")
         except Exception as e:
             logger.error(f"存储错误分析失败: {e}")
+            logger.debug(f"[analyze_failure] 存储错误分析失败 | error={e}")
 
         logger.info(f"失败分析完成: {getattr(task, 'name', 'N/A')} - {result.get('root_cause', 'N/A')}")
         return result
@@ -252,11 +277,14 @@ class Optimizer:
         """
         知识图谱优化：清理过时知识、合并重复、更新重要性
         """
+        logger.debug(f"[optimize_knowledge] 开始知识优化")
         try:
             summary = self.kg.get_all_knowledge_summary()
+            logger.debug(f"[optimize_knowledge] 获取摘要完成 | summary={json.dumps(summary, ensure_ascii=False)}")
 
             # 实际清理操作
             cleaned = self._cleanup_knowledge()
+            logger.debug(f"[optimize_knowledge] 清理完成 | cleaned={cleaned}")
 
             self._optimization_count += 1
             self._last_optimization_time = time.time()
@@ -270,14 +298,19 @@ class Optimizer:
             }
         except Exception as e:
             logger.error(f"知识图谱优化失败: {e}")
+            logger.debug(f"[optimize_knowledge] 优化失败 | error={e}")
             return {"action": "optimization_failed", "error": str(e)}
 
     def _cleanup_knowledge(self) -> int:
         """执行实际的知识清理"""
+        logger.debug(f"[_cleanup_knowledge] 执行知识清理")
         try:
-            return self.kg.cleanup_old_knowledge()
+            result = self.kg.cleanup_old_knowledge()
+            logger.debug(f"[_cleanup_knowledge] 清理完成 | cleaned={result}")
+            return result
         except Exception as e:
             logger.error(f"知识清理执行失败: {e}")
+            logger.debug(f"[_cleanup_knowledge] 清理失败 | error={e}")
             return 0
 
     @property
