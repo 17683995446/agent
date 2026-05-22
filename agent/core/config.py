@@ -17,6 +17,13 @@ class LLMConfig:
     max_tokens: int = 2048
     timeout: int = 60
 
+    # S8.1修复：防止API密钥通过日志/打印泄露
+    def __repr__(self):
+        return f"LLMConfig(provider={self.provider}, model={self.model}, base_url={self.base_url})"
+
+    def __str__(self):
+        return self.__repr__()
+
 
 @dataclass
 class KnowledgeConfig:

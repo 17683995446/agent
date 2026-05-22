@@ -335,7 +335,8 @@ class Optimizer:
         except Exception as e:
             logger.error(f"知识图谱优化失败: {e}")
             logger.debug(f"[optimize_knowledge] 优化失败 | error={e}")
-            return {"action": "optimization_failed", "error": str(e)}
+            # S6.2修复：返回通用错误消息，不暴露内部细节
+            return {"action": "optimization_failed", "error": "知识图谱优化失败，请查看日志获取详情"}
 
     def _cleanup_knowledge(self) -> int:
         """执行实际的知识清理"""

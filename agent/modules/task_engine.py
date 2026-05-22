@@ -50,6 +50,15 @@ class TaskEngine(ITaskEngine):
                max_retries: int = None, metadata: Dict = None) -> Task:
         """提交新任务"""
         logger.debug(f"[submit] 提交任务 | name={name}, task_type={task_type}, priority={priority}, timeout={timeout}, max_retries={max_retries}")
+        
+        # S2.1修复：输入验证
+        if not isinstance(name, str) or not name.strip():
+            name = f"unnamed_{int(time.time())}"
+        if len(name) > 200:
+            name = name[:200]
+        if not callable(handler):
+            raise TypeError("handler 必须是可调用对象")
+        
         use_default_timeout = timeout is None or timeout <= 0
         use_default_retries = max_retries is None
         with self._lock:
@@ -79,6 +88,9 @@ class TaskEngine(ITaskEngine):
     def submit_many(self, tasks: List[Dict]) -> List[Task]:
         """批量提交任务"""
         logger.debug(f"[submit_many] 批量提交 | count={len(tasks)}")
+        # S4.2修复：限制批量大小
+        if len(tasks) > 1000:
+            raise ValueError(f"批量提交上限为1000个任务，当前{len(tasks)}个")
         result = [self.submit(**t) for t in tasks]
         logger.debug(f"[submit_many] 批量提交完成 | submitted={len(result)}")
         return result

@@ -51,11 +51,16 @@ class KnowledgeGraph:
         self._local = threading.local()  # 线程本地存储
         self._all_connections = []  # 跟踪所有连接
         self._connections_lock = threading.Lock()
+        # S7.4修复：添加关闭标志，防止close后其他线程使用已关闭连接
+        self._closed = False
         self._init_db()
         logger.debug(f"[__init__] KnowledgeGraph初始化完成 | db_path={db_path}")
 
     def _get_connection(self) -> sqlite3.Connection:
         """获取线程专属连接"""
+        # S7.4修复：检查关闭标志
+        if self._closed:
+            raise RuntimeError("KnowledgeGraph 已关闭，无法获取新连接")
         if not hasattr(self._local, 'conn') or self._local.conn is None:
             logger.debug(f"[_get_connection] 创建新连接")
             conn = sqlite3.connect(
@@ -218,8 +223,10 @@ class KnowledgeGraph:
             params = []
 
             if query:
-                conditions.append("(title LIKE ? OR content LIKE ? OR tags LIKE ?)")
-                q = f"%{query}%"
+                conditions.append("(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')")
+                # S1.2修复：转义LIKE通配符，防止用户输入改变查询语义
+                escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                q = f"%{escaped}%"
                 params.extend([q, q, q])
 
             if category:
@@ -378,6 +385,11 @@ class KnowledgeGraph:
                          tags: str = "", importance: float = 0.5, related_to: Optional[int] = None) -> int:
         """存储一条经验，自动关联相关节点"""
         logger.debug(f"[store_experience] 存储经验 | title={title}, category={category}, importance={importance}")
+        # S4.1修复：限制content长度防止数据库膨胀
+        if len(content) > 10000:
+            content = content[:10000]
+        if len(title) > 500:
+            title = title[:500]
         node = KnowledgeNode(
             category=category,
             title=title,
@@ -500,11 +512,15 @@ class KnowledgeGraph:
                     pass
             self._all_connections.clear()
         self._local.conn = None
+        # S7.4修复：设置关闭标志
+        self._closed = True
         logger.debug("知识图谱连接已关闭")
 
     def cleanup_old_knowledge(self, max_age_seconds: float = 3600, min_importance: float = 0.2, keep_recent_logs: int = 100) -> int:
         """清理过时知识（公共接口）"""
         logger.debug(f"[cleanup_old_knowledge] 开始清理 | max_age={max_age_seconds}, min_importance={min_importance}, keep_logs={keep_recent_logs}")
+        # S1.1修复：强制验证参数为合法整数，防止SQL注入
+        keep_recent_logs = max(1, int(keep_recent_logs))
         cleaned = 0
         with self._transaction() as conn:
             c = conn.cursor()

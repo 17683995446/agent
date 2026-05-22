@@ -192,6 +192,10 @@ class Agent:
                 recent = self.engine.get_recent_completed(limit=self.config.optimize_interval)
                 if recent:
                     with self._optimize_queue_lock:
+                        # S5.1修复：限制优化队列大小，防止内存耗尽
+                        MAX_OPTIMIZE_QUEUE_SIZE = 100
+                        if len(self._optimize_queue) >= MAX_OPTIMIZE_QUEUE_SIZE:
+                            self._optimize_queue.pop(0)
                         self._optimize_queue.append(recent)
                     logger.debug(f"[_on_task_done] 优化入队成功 | recent_count={len(recent)}")
                 else:
@@ -336,6 +340,11 @@ class Agent:
             cycle_interval: 循环间隔(秒)
         """
         logger.debug(f"[run] 启动请求 | max_cycles={max_cycles}, cycle_interval={cycle_interval}")
+        # S2.4修复：参数范围验证
+        if max_cycles < 0:
+            raise ValueError("max_cycles 不能为负数")
+        if cycle_interval < 0.1:
+            raise ValueError("cycle_interval 必须 >= 0.1 秒")
         with self._lock:
             if self._running:
                 logger.warning("Agent已在运行中")
@@ -384,9 +393,11 @@ class Agent:
                     logger.debug(f"[run] 循环异常 | cycle={current_cycle}, error={e}")
                     # 自动修复：记录错误，继续运行
                     try:
+                        # S6.1修复：只记录错误类型和摘要，不存储完整堆栈到知识图谱
+                        error_info = f"错误类型: {type(e).__name__}\n错误信息: {str(e)[:200]}"
                         self.knowledge.store_experience(
                             title=f"运行时错误 #{current_cycle}",
-                            content=f"错误: {str(e)}\n堆栈: {traceback.format_exc()[:500]}",
+                            content=error_info,
                             category="error",
                             tags="runtime-error,auto-recovery",
                             importance=0.7,
