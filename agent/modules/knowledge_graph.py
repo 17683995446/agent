@@ -61,15 +61,17 @@ class KnowledgeGraph:
             conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
-                timeout=30.0,  # 等待锁超时
+                timeout=60.0,  # D1修复：增加等待锁超时到60秒
                 isolation_level=None,  # 自动提交模式，避免长期持有锁
             )
             conn.row_factory = sqlite3.Row
             # 启用WAL模式提高并发性能
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            # C1修复：增加busy_timeout，多Agent共享时等待锁释放
-            conn.execute("PRAGMA busy_timeout=5000")
+            # D1修复：大幅增加busy_timeout到30秒，支持多进程高并发
+            conn.execute("PRAGMA busy_timeout=30000")
+            # D1修复：增加缓存大小提高性能
+            conn.execute("PRAGMA cache_size=10000")
             self._local.conn = conn
             with self._connections_lock:
                 self._all_connections.append(conn)
