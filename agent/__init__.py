@@ -168,6 +168,21 @@ class Agent:
     def _on_task_done(self, task: Task):
         """任务完成回调 - 触发优化和知识存储（P2修复：异步优化）"""
         logger.debug(f"[_on_task_done] 任务完成回调触发 | task_id={task.id}, status={task.status}, name={task.name}")
+
+        # O7修复：记录任务执行日志到知识图谱，支持get_task_stats()查询
+        try:
+            self.knowledge.log_task(
+                task_id=task.id,
+                task_type=task.task_type,
+                status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+                result=str(task.result)[:500] if task.result else '',
+                error=str(task.error)[:500] if task.error else '',
+                duration=task.duration or 0,
+            )
+            logger.debug(f"[_on_task_done] 任务日志已记录 | task_id={task.id}")
+        except Exception as e:
+            logger.debug(f"[_on_task_done] 任务日志记录失败 | error={e}")
+
         with self._lock:
             self._tasks_since_last_optimize += 1
             should_optimize = self._tasks_since_last_optimize >= self.config.optimize_interval
