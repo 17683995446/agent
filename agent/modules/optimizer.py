@@ -59,14 +59,31 @@ class Optimizer:
         # 准备任务摘要
         task_summaries = []
         for t in tasks:
-            task_summaries.append({
-                "name": getattr(t, 'name', 'unknown'),
-                "type": getattr(t, 'task_type', 'unknown'),
-                "status": getattr(t, 'status', 'unknown').value if hasattr(t.status, 'value') else str(t.status),
-                "duration": round(getattr(t, 'duration', 0), 2),
-                "error": (getattr(t, 'error', '') or '')[:200],
-                "retries": getattr(t, 'retries', 0),
-            })
+            # E1修复：兼容Task对象和字典两种输入
+            if isinstance(t, dict):
+                # 字典输入
+                status_val = t.get('status', 'unknown')
+                status_str = status_val.value if hasattr(status_val, 'value') else str(status_val)
+                task_summaries.append({
+                    "name": t.get('name', 'unknown'),
+                    "type": t.get('type', t.get('task_type', 'unknown')),
+                    "status": status_str,
+                    "duration": round(t.get('duration', 0), 2),
+                    "error": str(t.get('error', ''))[:200] if t.get('error') else '',
+                    "retries": t.get('retries', 0),
+                })
+            else:
+                # Task对象输入
+                status_val = getattr(t, 'status', 'unknown')
+                status_str = status_val.value if hasattr(status_val, 'value') else str(status_val)
+                task_summaries.append({
+                    "name": getattr(t, 'name', 'unknown'),
+                    "type": getattr(t, 'task_type', 'unknown'),
+                    "status": status_str,
+                    "duration": round(getattr(t, 'duration', 0), 2),
+                    "error": str(getattr(t, 'error', '') or '')[:200],
+                    "retries": getattr(t, 'retries', 0),
+                })
         logger.debug(f"[_reflect_internal] 任务摘要准备完成 | summaries={len(task_summaries)}")
 
         # 查询相关经验
