@@ -161,6 +161,8 @@ class KnowledgeGraph:
             c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_category ON nodes(category)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_tags ON nodes(tags)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_title ON nodes(title)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_content ON nodes(content)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_importance ON nodes(importance)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_task_logs_type ON task_logs(task_type)")
@@ -391,6 +393,46 @@ class KnowledgeGraph:
 
         logger.debug(f"[store_experience] 存储完成 | node_id={node_id}")
         return node_id
+
+    def store_experience_batch(self, experiences: List[Dict[str, Any]]) -> int:
+        """批量存储经验（性能优化：单次事务批量插入）"""
+        logger.debug(f"[store_experience_batch] 批量存储 | count={len(experiences)}")
+        if not experiences:
+            return 0
+
+        now = time.time()
+        rows = []
+        for exp in experiences:
+            rows.append((
+                exp.get('category', 'experience'),
+                exp.get('title', ''),
+                exp.get('content', ''),
+                exp.get('tags', ''),
+                exp.get('importance', 0.5),
+                0,  # usage_count
+                0.0,  # success_rate
+                now,
+                now,
+            ))
+
+        conn = self._get_connection()
+        with self._lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                c = conn.cursor()
+                c.executemany("""
+                    INSERT INTO nodes (category, title, content, tags, importance, usage_count, success_rate, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, rows)
+                conn.commit()
+                inserted = c.rowcount
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"[store_experience_batch] 批量插入失败 | error={e}")
+                raise e
+
+        logger.debug(f"[store_experience_batch] 批量存储完成 | inserted={inserted}")
+        return inserted
 
     def query_experience(self, query: str, limit: int = 5) -> List[KnowledgeNode]:
         """查询相关经验（P4修复：查询后自动更新usage_count）"""
