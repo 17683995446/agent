@@ -177,18 +177,37 @@ class Optimizer:
         lessons = json.dumps(suggestions, ensure_ascii=False)[:500]
         for t in tasks:
             try:
-                self.kg.log_task(
-                    task_id=getattr(t, 'id', 'unknown'),
-                    task_type=getattr(t, 'task_type', 'unknown'),
-                    status=getattr(t, 'status', 'unknown').value if hasattr(t.status, 'value') else str(getattr(t, 'status', '')),
-                    result=_safe_serialize(getattr(t, 'result', None), 500),
-                    error=getattr(t, 'error', '') or '',
-                    duration=getattr(t, 'duration', 0),
-                    lessons=lessons,
-                )
+                # F7修复：兼容Task对象和字典两种输入
+                if isinstance(t, dict):
+                    # 字典输入
+                    status_val = t.get('status', 'unknown')
+                    status_str = status_val.value if hasattr(status_val, 'value') else str(status_val)
+                    self.kg.log_task(
+                        task_id=t.get('id', 'unknown'),
+                        task_type=t.get('type', t.get('task_type', 'unknown')),
+                        status=status_str,
+                        result=_safe_serialize(t.get('result', None), 500),
+                        error=str(t.get('error', '') or ''),
+                        duration=t.get('duration', 0),
+                        lessons=lessons,
+                    )
+                else:
+                    # Task对象输入
+                    status_val = getattr(t, 'status', 'unknown')
+                    status_str = status_val.value if hasattr(status_val, 'value') else str(status_val)
+                    self.kg.log_task(
+                        task_id=getattr(t, 'id', 'unknown'),
+                        task_type=getattr(t, 'task_type', 'unknown'),
+                        status=status_str,
+                        result=_safe_serialize(getattr(t, 'result', None), 500),
+                        error=getattr(t, 'error', '') or '',
+                        duration=getattr(t, 'duration', 0),
+                        lessons=lessons,
+                    )
             except Exception as e:
                 logger.error(f"记录任务日志失败: {e}")
-                logger.debug(f"[_reflect_internal] 记录任务日志失败 | task_id={getattr(t, 'id', 'unknown')}, error={e}")
+                task_id = t.get('id', 'unknown') if isinstance(t, dict) else getattr(t, 'id', 'unknown')
+                logger.debug(f"[_reflect_internal] 记录任务日志失败 | task_id={task_id}, error={e}")
 
         self._optimization_count += 1
         self._last_optimization_time = time.time()
