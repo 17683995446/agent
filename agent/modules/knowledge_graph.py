@@ -62,8 +62,47 @@ class KnowledgeGraph:
         self._connections_lock = threading.Lock()
         # S7.4修复：添加关闭标志，防止close后其他线程使用已关闭连接
         self._closed = False
+        # C7/C8修复：验证数据库文件实际可写（通过尝试写入）
+        self._verify_db_writable()
         self._init_db()
         logger.debug(f"[__init__] KnowledgeGraph初始化完成 | db_path={db_path}")
+
+    def _verify_db_writable(self):
+        """C7/C8修复：验证数据库文件实际可写"""
+        # 检查是否是URI模式（如 file:...?mode=ro）
+        if self.db_path.startswith("file:"):
+            # URI模式下，如果包含mode=ro则是只读
+            if "mode=ro" in self.db_path.lower():
+                raise ValueError(f"数据库URI指定为只读模式: {self.db_path}")
+            # 其他URI模式尝试连接验证
+            try:
+                conn = sqlite3.connect(self.db_path, uri=True, timeout=5)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("CREATE TABLE IF NOT EXISTS _write_test_ (id INTEGER PRIMARY KEY)")
+                conn.execute("DROP TABLE IF EXISTS _write_test_")
+                conn.commit()
+                conn.close()
+            except sqlite3.OperationalError as e:
+                if "readonly" in str(e).lower() or "attempt to write" in str(e).lower():
+                    raise ValueError(f"数据库URI只读或不可写: {self.db_path} ({e})")
+            except PermissionError as e:
+                raise ValueError(f"数据库URI无写入权限: {self.db_path} ({e})")
+        # 普通文件路径
+        elif os.path.exists(self.db_path):
+            try:
+                # 尝试以写入模式打开并执行简单操作
+                conn = sqlite3.connect(self.db_path, timeout=5)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("CREATE TABLE IF NOT EXISTS _write_test_ (id INTEGER PRIMARY KEY)")
+                conn.execute("DROP TABLE IF EXISTS _write_test_")
+                conn.commit()
+                conn.close()
+            except sqlite3.OperationalError as e:
+                if "readonly" in str(e).lower() or "attempt to write" in str(e).lower():
+                    raise ValueError(f"数据库文件只读或不可写: {self.db_path} ({e})")
+                # 其他错误可能是数据库锁定，不视为只读
+            except PermissionError as e:
+                raise ValueError(f"数据库文件无写入权限: {self.db_path} ({e})")
 
     def _get_connection(self) -> sqlite3.Connection:
         """获取线程专属连接"""
@@ -525,8 +564,19 @@ class KnowledgeGraph:
         self._closed = True
         logger.debug("知识图谱连接已关闭")
 
-    def cleanup_old_knowledge(self, max_age_seconds: float = 3600, min_importance: float = 0.2, keep_recent_logs: int = 100) -> int:
-        """清理过时知识（公共接口）"""
+    def cleanup_old_knowledge(self, max_age_seconds: float = 3600, min_importance: float = 0.2, keep_recent_logs: int = 100, days: float = None) -> int:
+        """清理过时知识（公共接口）
+
+        Args:
+            max_age_seconds: 最大存活时间（秒）
+            min_importance: 最小重要性阈值
+            keep_recent_logs: 保留最近多少条任务日志
+            days: 最大存活时间（天），如果提供则覆盖max_age_seconds
+        """
+        # C6修复：支持days参数，与max_age_seconds互斥
+        if days is not None:
+            max_age_seconds = days * 86400
+
         logger.debug(f"[cleanup_old_knowledge] 开始清理 | max_age={max_age_seconds}, min_importance={min_importance}, keep_logs={keep_recent_logs}")
         # S1.1修复：强制验证参数为合法整数，防止SQL注入
         keep_recent_logs = max(1, int(keep_recent_logs))
