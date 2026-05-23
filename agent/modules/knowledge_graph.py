@@ -46,7 +46,16 @@ class KnowledgeGraph:
     def __init__(self, db_path: str = "data/knowledge.db"):
         logger.debug(f"[__init__] 初始化KnowledgeGraph | db_path={db_path}")
         self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
+        # R5修复：验证数据库路径可写
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            if not os.path.exists(db_dir):
+                try:
+                    os.makedirs(db_dir, exist_ok=True)
+                except OSError as e:
+                    raise ValueError(f"知识库目录不可创建: {db_dir} ({e})")
+            if not os.access(db_dir, os.W_OK):
+                raise ValueError(f"知识库目录不可写: {db_dir}")
         self._lock = threading.RLock()  # 可重入锁
         self._local = threading.local()  # 线程本地存储
         self._all_connections = []  # 跟踪所有连接

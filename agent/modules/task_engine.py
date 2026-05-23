@@ -21,11 +21,13 @@ from ..core.interfaces import ITaskEngine, Task, TaskStatus
 class TaskEngine(ITaskEngine):
     """任务执行引擎（增强版）"""
 
-    def __init__(self, max_workers: int = 3, retry_limit: int = 3, timeout: int = 300):
-        logger.debug(f"[__init__] 初始化TaskEngine | max_workers={max_workers}, retry_limit={retry_limit}, timeout={timeout}")
+    def __init__(self, max_workers: int = 3, retry_limit: int = 3, timeout: int = 300, max_queue_size: int = 1000):
+        logger.debug(f"[__init__] 初始化TaskEngine | max_workers={max_workers}, retry_limit={retry_limit}, timeout={timeout}, max_queue_size={max_queue_size}")
         self.max_workers = max_workers
         self.retry_limit = retry_limit
         self.default_timeout = timeout
+        # R7修复：任务队列最大容量限制
+        self.max_queue_size = max_queue_size if max_queue_size > 0 else 1000
         self._queue: List[Task] = []
         self._running: Dict[str, Task] = {}
         self._completed: List[Task] = []
@@ -65,6 +67,11 @@ class TaskEngine(ITaskEngine):
             if self._shutdown:
                 logger.debug(f"[submit] 引擎已关闭，拒绝提交")
                 raise RuntimeError("执行引擎已关闭，无法提交新任务")
+
+            # R7修复：队列大小限制检查
+            if len(self._queue) >= self.max_queue_size:
+                logger.warning(f"任务队列已满 ({len(self._queue)}/{self.max_queue_size})，拒绝提交: {name}")
+                raise RuntimeError(f"任务队列已满 ({self.max_queue_size})，无法提交新任务")
 
             task = Task(
                 id=str(uuid.uuid4().hex[:12]),

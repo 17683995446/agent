@@ -3,6 +3,7 @@
 整合：执行引擎 + 优化模块 + 知识图谱 + 保活机制
 """
 import time
+import os
 import logging
 import signal
 import sys
@@ -11,6 +12,7 @@ import threading
 from typing import Optional, Callable, List, Dict, Any
 
 from .core.config import AgentConfig
+from .core.config_manager import ConfigManager
 from .modules.knowledge_graph import KnowledgeGraph
 from .modules.llm_client import LLMClient
 from .modules.task_engine import TaskEngine, Task, TaskStatus
@@ -38,6 +40,9 @@ class Agent:
         self._tasks_since_last_optimize = 0
         self._lock = threading.RLock()  # 状态锁
         self._shutdown_event = threading.Event()
+        # R1/R2修复：信号处理相关
+        self._original_sigterm = None
+        self._original_sigint = None
         logger.debug(f"[__init__] 基础状态初始化完成 | max_concurrent={self.config.max_concurrent_tasks}, retry_limit={self.config.task_retry_limit}, timeout={self.config.task_timeout}")
 
         # 初始化三大模块
@@ -49,6 +54,7 @@ class Agent:
             max_workers=self.config.max_concurrent_tasks,
             retry_limit=self.config.task_retry_limit,
             timeout=self.config.task_timeout,
+            max_queue_size=self.config.task_queue_size,
         )
         logger.debug(f"[__init__] TaskEngine初始化完成 | workers={self.config.max_concurrent_tasks}")
         self.optimizer = Optimizer(self.knowledge, self.llm)
@@ -61,6 +67,20 @@ class Agent:
         # 自定义任务生成器
         self._task_generator: Optional[Callable] = None
 
+        # R9修复：集成ConfigManager，支持运行时配置热更新
+        self._config_manager = None
+        try:
+            config_dir = os.path.dirname(self.config.knowledge.db_path) or "."
+            config_path = os.path.join(config_dir, "agent_config.yaml")
+            self._config_manager = ConfigManager(config_path)
+            # 注册配置变更回调
+            self._config_manager.register_callback('agent.*', self._on_config_change)
+            self._config_manager.register_callback('llm.*', self._on_config_change)
+            logger.debug(f"[__init__] ConfigManager初始化完成 | path={config_path}")
+        except Exception as e:
+            logger.warning(f"ConfigManager初始化失败，将使用静态配置: {e}")
+            logger.debug(f"[__init__] ConfigManager初始化失败 | error={e}")
+
         # P2修复：优化专用后台线程
         self._optimize_thread: Optional[threading.Thread] = None
         self._optimize_queue: List = []
@@ -70,6 +90,9 @@ class Agent:
 
         # 初始经验
         self._seed_initial_knowledge()
+
+        # R1/R2修复：初始化时就注册信号处理器（不依赖run()调用）
+        self._register_signal_handlers()
 
         logger.info("Agent初始化完成 ✓")
 
@@ -107,6 +130,131 @@ class Agent:
         self._optimize_thread.start()
         logger.info("后台优化线程已启动")
         logger.debug(f"[_start_optimize_thread] 线程已启动 | name=OptimizeWorker, daemon=True")
+
+    def _register_signal_handlers(self):
+        """R1/R2修复：注册SIGTERM和SIGINT信号处理器"""
+        import atexit
+        # 信号处理只能在主线程中注册
+        # 注意：在multiprocessing fork的子进程中，需要重新注册
+        try:
+            current = threading.current_thread()
+            main = threading.main_thread()
+            is_main = (current is main) or (current.name == 'MainThread')
+        except Exception:
+            is_main = True  # 无法判断时尝试注册
+
+        if not is_main:
+            logger.debug(f"[_register_signal_handlers] 非主线程(current={current.name}, main={main.name})，跳过信号注册")
+            return
+
+        def _signal_handler(signum, frame):
+            logger.info(f"收到信号 {signal.Signals(signum).name}，触发优雅关闭...")
+            logger.debug(f"[_signal_handler] 信号={signum}, name={signal.Signals(signum).name}")
+            self._shutdown_event.set()
+            with self._lock:
+                self._running = False
+            # 在新线程中执行stop()，避免在信号处理器中执行复杂操作
+            def _stop_in_thread():
+                try:
+                    self.stop()
+                except Exception as e:
+                    logger.error(f"信号处理中stop()异常: {e}")
+            t = threading.Thread(target=_stop_in_thread, daemon=True)
+            t.start()
+            t.join(timeout=10)
+
+        try:
+            self._original_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
+            logger.debug(f"[_register_signal_handlers] SIGTERM处理器已注册")
+        except (OSError, ValueError) as e:
+            logger.debug(f"[_register_signal_handlers] SIGTERM注册失败: {e}")
+
+        try:
+            self._original_sigint = signal.signal(signal.SIGINT, _signal_handler)
+            logger.debug(f"[_register_signal_handlers] SIGINT处理器已注册")
+        except (OSError, ValueError) as e:
+            logger.debug(f"[_register_signal_handlers] SIGINT注册失败: {e}")
+
+        # 注册atexit确保退出时清理
+        atexit.register(self._atexit_cleanup)
+        logger.info("信号处理器已注册 (SIGTERM/SIGINT)")
+        logger.debug(f"[_register_signal_handlers] 信号处理器注册完成")
+
+    def _atexit_cleanup(self):
+        """R1/R2修复：atexit清理"""
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+    def _restore_signal_handlers(self):
+        """R1/R2修复：恢复原始信号处理器"""
+        try:
+            current = threading.current_thread()
+            main = threading.main_thread()
+            is_main = (current is main) or (current.name == 'MainThread')
+        except Exception:
+            is_main = True
+        if not is_main:
+            return
+        try:
+            if self._original_sigterm is not None:
+                signal.signal(signal.SIGTERM, self._original_sigterm)
+                self._original_sigterm = None
+                logger.debug(f"[_restore_signal_handlers] SIGTERM已恢复")
+        except (OSError, ValueError):
+            pass
+
+    def _on_config_change(self, event):
+        """R9修复：配置变更回调处理"""
+        logger.debug(f"[_on_config_change] 配置变更 | key={event.key}, old={event.old_value}, new={event.new_value}, source={event.source}")
+        try:
+            key = event.key
+            new_value = event.new_value
+
+            if key == 'agent.max_concurrent_tasks':
+                self.config.max_concurrent_tasks = int(new_value)
+                logger.info(f"配置热更新: max_concurrent_tasks → {new_value}")
+            elif key == 'agent.task_retry_limit':
+                self.config.task_retry_limit = int(new_value)
+                logger.info(f"配置热更新: task_retry_limit → {new_value}")
+            elif key == 'agent.task_timeout':
+                self.config.task_timeout = int(new_value)
+                logger.info(f"配置热更新: task_timeout → {new_value}")
+            elif key == 'agent.optimize_interval':
+                self.config.optimize_interval = int(new_value)
+                logger.info(f"配置热更新: optimize_interval → {new_value}")
+            elif key == 'agent.task_queue_size':
+                self.config.task_queue_size = int(new_value)
+                self.engine.max_queue_size = int(new_value)
+                logger.info(f"配置热更新: task_queue_size → {new_value}")
+            elif key == 'llm.temperature':
+                self.config.llm.temperature = float(new_value)
+                logger.info(f"配置热更新: llm.temperature → {new_value}")
+            elif key == 'llm.max_tokens':
+                self.config.llm.max_tokens = int(new_value)
+                logger.info(f"配置热更新: llm.max_tokens → {new_value}")
+            elif key == 'llm.model':
+                self.config.llm.model = str(new_value)
+                logger.info(f"配置热更新: llm.model → {new_value}")
+            else:
+                logger.debug(f"[_on_config_change] 未处理的配置项: {key}")
+        except Exception as e:
+            logger.error(f"配置变更处理失败: {e}")
+
+    def update_config(self, key: str, value: Any) -> bool:
+        """R9修复：运行时更新配置（对外接口）"""
+        if self._config_manager is None:
+            logger.warning("ConfigManager未初始化，无法更新配置")
+            return False
+        result = self._config_manager.set(key, value, validate=True, notify=True, source='api')
+        logger.debug(f"[update_config] 配置更新 | key={key}, value={value}, result={result}")
+        return result
+
+    @property
+    def config_manager(self):
+        """R9修复：暴露ConfigManager实例"""
+        return self._config_manager
 
     def _seed_initial_knowledge(self):
         """注入初始知识"""
@@ -434,6 +582,8 @@ class Agent:
     def stop(self):
         """停止Agent（线程安全）"""
         logger.debug(f"[stop] 开始停止Agent")
+        # R1/R2修复：恢复原始信号处理器
+        self._restore_signal_handlers()
         # E2修复：无论_running状态如何，都要清理资源
         was_running = False
         with self._lock:
