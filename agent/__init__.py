@@ -13,6 +13,7 @@ from typing import Optional, Callable, List, Dict, Any
 
 from .core.config import AgentConfig
 from .core.config_manager import ConfigManager
+from .core.interfaces import IAgent
 from .modules.knowledge_graph import KnowledgeGraph
 from .modules.llm_client import LLMClient
 from .modules.task_engine import TaskEngine, Task, TaskStatus
@@ -21,7 +22,7 @@ from .modules.optimizer import Optimizer
 logger = logging.getLogger(__name__)
 
 
-class Agent:
+class Agent(IAgent):
     """
     极简全能持续运行Agent（增强版）
 
@@ -693,6 +694,11 @@ class Agent:
 
         logger.info("Agent已优雅关闭 ✓")
         logger.debug(f"[stop] Agent停止完成")
+
+    @property
+    def is_running(self) -> bool:
+        """A1修复：实现IAgent接口的is_running属性"""
+        return self._running
 
     @property
     def status(self) -> Dict[str, Any]:

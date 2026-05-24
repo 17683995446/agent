@@ -7,11 +7,12 @@ import logging
 import time
 import threading
 from typing import Optional, List, Dict, Any
+from agent.core.interfaces import ILLMClient
 
 logger = logging.getLogger(__name__)
 
 
-class LLMClient:
+class LLMClient(ILLMClient):
     """统一LLM客户端（增强版）"""
 
     def __init__(self, config):

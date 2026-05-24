@@ -11,6 +11,7 @@ import threading
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
+from agent.core.interfaces import IKnowledgeGraph
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ class KnowledgeEdge:
     weight: float = 1.0
 
 
-class KnowledgeGraph:
+class KnowledgeGraph(IKnowledgeGraph):
     """知识图谱 - SQLite实现（线程安全 + 连接池）"""
 
     def __init__(self, db_path: str = "data/knowledge.db"):
@@ -210,7 +211,15 @@ class KnowledgeGraph:
                 )
             """)
 
-            # 索引
+            conn.commit()
+            logger.info(f"知识图谱初始化完成: {self.db_path}")
+            logger.debug(f"[_init_db] 数据库表结构初始化完成 | tables=nodes,edges,task_logs,strategies")
+
+            # A6修复：Schema迁移 - 自动补全缺失列（必须在索引创建之前）
+            self._migrate_schema(conn)
+            logger.debug(f"[_init_db] Schema迁移检查完成")
+
+            # 索引（在Schema迁移之后创建，确保列存在）
             c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_category ON nodes(category)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_tags ON nodes(tags)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_title ON nodes(title)")
@@ -222,8 +231,62 @@ class KnowledgeGraph:
             c.execute("CREATE INDEX IF NOT EXISTS idx_task_logs_status ON task_logs(status)")
 
             conn.commit()
-            logger.info(f"知识图谱初始化完成: {self.db_path}")
-            logger.debug(f"[_init_db] 数据库表结构初始化完成 | tables=nodes,edges,task_logs,strategies")
+            logger.debug(f"[_init_db] 索引创建完成")
+
+    def _migrate_schema(self, conn: sqlite3.Connection):
+        """A6修复：自动检测并补全缺失的数据库列"""
+        c = conn.cursor()
+
+        # 定义每张表的期望列结构
+        expected_columns = {
+            'nodes': {
+                'content': "TEXT DEFAULT ''",
+                'tags': "TEXT DEFAULT ''",
+                'importance': "REAL DEFAULT 0.5",
+                'usage_count': "INTEGER DEFAULT 0",
+                'success_rate': "REAL DEFAULT 0.0",
+                'created_at': "REAL DEFAULT 0",
+                'updated_at': "REAL DEFAULT 0",
+            },
+            'edges': {
+                'relation': "TEXT DEFAULT ''",
+                'weight': "REAL DEFAULT 1.0",
+            },
+            'task_logs': {
+                'result': "TEXT DEFAULT ''",
+                'error': "TEXT DEFAULT ''",
+                'duration': "REAL DEFAULT 0",
+                'lessons': "TEXT DEFAULT ''",
+                'created_at': "REAL DEFAULT 0",
+            },
+            'strategies': {
+                'description': "TEXT DEFAULT ''",
+                'context': "TEXT DEFAULT ''",
+                'success_count': "INTEGER DEFAULT 0",
+                'fail_count': "INTEGER DEFAULT 0",
+                'is_active': "INTEGER DEFAULT 1",
+                'created_at': "REAL DEFAULT 0",
+                'updated_at': "REAL DEFAULT 0",
+            },
+        }
+
+        for table_name, columns in expected_columns.items():
+            # 获取当前表的列信息
+            c.execute(f"PRAGMA table_info({table_name})")
+            existing_cols = {row[1] for row in c.fetchall()}
+
+            # 补全缺失列
+            for col_name, col_def in columns.items():
+                if col_name not in existing_cols:
+                    try:
+                        c.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}")
+                        logger.info(f"Schema迁移: {table_name} 表添加列 {col_name}")
+                        logger.debug(f"[_migrate_schema] 迁移 | table={table_name}, column={col_name}, def={col_def}")
+                    except sqlite3.OperationalError as e:
+                        logger.warning(f"Schema迁移失败: {table_name}.{col_name}: {e}")
+                        logger.debug(f"[_migrate_schema] 迁移失败 | table={table_name}, column={col_name}, error={e}")
+
+        conn.commit()
 
     # ========== 节点操作 ==========
 
